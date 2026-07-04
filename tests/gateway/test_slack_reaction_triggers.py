@@ -532,11 +532,26 @@ class TestHandleSlackReactionRemoved:
     async def test_inactive_thread_ignored(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
         adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        # Some other thread is in flight, but not the reacted message's — so
+        # the handler fetches to check for a parent root, then still ignores it.
+        _mark_active_thread(adapter, thread_ts="9999999999.000000")
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
 
         adapter._handle_slack_message.assert_not_awaited()
         client.conversations_replies.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_idle_bot_skips_lookup(self, monkeypatch):
+        # No turn in flight anywhere: bail before any Slack API call.
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        client.conversations_info.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_bots_own_reaction_removal_ignored(self, monkeypatch):

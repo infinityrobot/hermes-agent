@@ -16,7 +16,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any, Tuple, List
+from typing import Dict, Optional, Any, Tuple, List, NamedTuple
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -400,6 +400,21 @@ def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
         return True
     name = (file_obj.get("name") or "").strip().lower()
     return name.startswith("audio_message")
+
+
+class _ReactionContext(NamedTuple):
+    """Validated fields shared by the reaction_added / reaction_removed paths.
+
+    Produced by ``SlackAdapter._parse_reaction_event`` once the cheap
+    in-memory gates (trigger-emoji allowlist, message-item type, self-bot
+    reactor) have all passed.
+    """
+
+    emoji: str
+    channel_id: str
+    message_ts: str
+    user_id: str
+    team_id: str
 
 
 class SlackAdapter(BasePlatformAdapter):
@@ -2067,12 +2082,94 @@ class SlackAdapter(BasePlatformAdapter):
         Opt-in: the default is an empty set, which keeps ``reaction_added``
         a plain ack. Reads ``slack.reaction_triggers`` from config.yaml
         (a ``{enabled, emojis}`` mapping, a bare list, or a CSV string),
-        falling back to the ``SLACK_REACTION_TRIGGER_EMOJIS`` env var.
+        falling back to the ``SLACK_REACTION_TRIGGER_EMOJIS`` env var. The
+        parsed set is cached — this runs on every reaction event and the
+        config is fixed at runtime (mirrors ``_slack_mention_patterns``).
         """
+        cached = getattr(self, "_reaction_trigger_emojis_cache", None)
+        if cached is not None:
+            return cached
         raw = self.config.extra.get("reaction_triggers") if self.config.extra else None
         if raw is None:
             raw = os.getenv("SLACK_REACTION_TRIGGER_EMOJIS", "")
-        return _parse_reaction_trigger_emojis(raw)
+        emojis = _parse_reaction_trigger_emojis(raw)
+        self._reaction_trigger_emojis_cache = emojis
+        return emojis
+
+    def _parse_reaction_event(self, event: dict) -> Optional[_ReactionContext]:
+        """Validate a reaction event and extract the fields both handlers need.
+
+        Returns ``None`` (caller should ack and stop) unless: reaction
+        triggers are configured and this emoji matches, the item is a
+        message with a channel + ts, and the reactor is not one of our own
+        bot users. Also seeds ``_channel_team`` so ``_get_client`` resolves
+        the right workspace on multi-workspace installs.
+        """
+        trigger_emojis = self._slack_reaction_trigger_emojis()
+        if not trigger_emojis:
+            return None
+
+        # Normalise skin-tone variants ("thumbsup::skin-tone-2") to the base
+        # name so a toned reaction still matches its configured emoji.
+        emoji = str(event.get("reaction") or "").split("::", 1)[0].strip().strip(":").lower()
+        if not emoji or emoji not in trigger_emojis:
+            return None
+
+        item = event.get("item") or {}
+        if item.get("type") != "message":
+            return None  # file / file_comment reactions are not supported
+        channel_id = item.get("channel") or ""
+        message_ts = item.get("ts") or ""
+        if not channel_id or not message_ts:
+            return None
+
+        # Never let the bot act on its own reactions (lifecycle :eyes: /
+        # :white_check_mark:, or a summon emoji it echoes back).
+        user_id = event.get("user") or ""
+        if user_id and (
+            user_id == self._bot_user_id
+            or user_id in self._team_bot_user_ids.values()
+        ):
+            return None
+
+        team_id = (
+            event.get("team")
+            or event.get("team_id")
+            or self._channel_team.get(channel_id)
+            or ""
+        )
+        if team_id:
+            self._channel_team.setdefault(channel_id, team_id)
+
+        return _ReactionContext(emoji, channel_id, message_ts, user_id, team_id)
+
+    def _build_reaction_synthetic_event(
+        self,
+        *,
+        text: str,
+        ctx: _ReactionContext,
+        channel_type: str,
+        thread_ts: str,
+        event_ts: str,
+    ) -> dict:
+        """Build the base synthetic message event replayed by both handlers.
+
+        ``event_ts`` (not the original message ts) is used as ``ts`` so the
+        message deduper does not suppress reactions on already-processed
+        messages. Callers layer on extras (``files``, ``bot_id``).
+        """
+        synthetic: dict = {
+            "type": "message",
+            "text": text,
+            "user": ctx.user_id,
+            "channel": ctx.channel_id,
+            "channel_type": channel_type,
+            "ts": event_ts,
+            "thread_ts": thread_ts,
+        }
+        if ctx.team_id:
+            synthetic["team"] = ctx.team_id
+        return synthetic
 
     async def _handle_slack_reaction_added(self, event: dict) -> None:
         """Route an opt-in emoji reaction into the normal message pipeline.
@@ -2084,56 +2181,20 @@ class SlackAdapter(BasePlatformAdapter):
         with ``thread_ts`` forced to the reacted message so the reply lands
         in its thread. Without configured triggers this is a no-op ack.
         """
-        trigger_emojis = self._slack_reaction_trigger_emojis()
-        if not trigger_emojis:
+        ctx = self._parse_reaction_event(event)
+        if ctx is None:
             return
-
-        raw_emoji = str(event.get("reaction") or "")
-        # Normalise skin-tone variants ("thumbsup::skin-tone-2") to the base
-        # name so a toned reaction still matches its configured emoji.
-        emoji = raw_emoji.split("::", 1)[0].strip().strip(":").lower()
-        if not emoji or emoji not in trigger_emojis:
-            return
-
-        item = event.get("item") or {}
-        if item.get("type") != "message":
-            return  # file / file_comment reactions are not supported
-        channel_id = item.get("channel") or ""
-        message_ts = item.get("ts") or ""
-        if not channel_id or not message_ts:
-            return
-
-        user_id = event.get("user") or ""
-        # Never let the bot summon itself (e.g. via its own lifecycle
-        # reactions or a summon emoji it echoes back).
-        if user_id and (
-            user_id == self._bot_user_id
-            or user_id in self._team_bot_user_ids.values()
-        ):
-            return
-
-        team_id = (
-            event.get("team")
-            or event.get("team_id")
-            or self._channel_team.get(channel_id)
-            or ""
-        )
-        # Seed the channel→team map so _get_client resolves the right
-        # workspace client on multi-workspace installs (the fetch below and
-        # the notice on failure both go through _get_client).
-        if team_id:
-            self._channel_team.setdefault(channel_id, team_id)
 
         # Once per message+emoji: a pile-on of the same reaction from other
         # users (or a Socket Mode redelivery) must not summon repeatedly.
         # Recorded before the fetch so concurrent reactors collapse to one
         # summon; discarded on fetch failure so an invite-and-retry works.
-        summon_key = f"{team_id}:{channel_id}:{message_ts}:{emoji}"
+        summon_key = f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
         if self._reaction_summon_dedup.is_duplicate(summon_key):
             return
 
         original, error_detail = await self._fetch_slack_message_for_reaction(
-            channel_id, message_ts
+            ctx.channel_id, ctx.message_ts
         )
         if original is None:
             # Most fetch failures are access problems (not_in_channel,
@@ -2144,17 +2205,17 @@ class SlackAdapter(BasePlatformAdapter):
             self._reaction_summon_dedup.discard(summon_key)
             logger.warning(
                 "[Slack] Reaction trigger :%s: could not fetch message %s in %s: %s",
-                emoji,
-                message_ts,
-                channel_id,
+                ctx.emoji,
+                ctx.message_ts,
+                ctx.channel_id,
                 error_detail or "unknown error",
             )
             try:
-                await self._get_client(channel_id).chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=message_ts,
+                await self._get_client(ctx.channel_id).chat_postMessage(
+                    channel=ctx.channel_id,
+                    thread_ts=ctx.message_ts,
                     text=(
-                        f"I saw the :{emoji}: reaction, but I don't have access "
+                        f"I saw the :{ctx.emoji}: reaction, but I don't have access "
                         "to that message or channel. Invite me to the channel "
                         "and try again."
                     ),
@@ -2162,17 +2223,15 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug(
                     "[Slack] Reaction trigger access notice failed for %s: %s",
-                    channel_id,
+                    ctx.channel_id,
                     exc,
                 )
             return
 
-        bot_uid = (
-            self._team_bot_user_ids.get(team_id) if team_id else None
-        ) or self._bot_user_id
+        bot_uid = self._team_bot_user_ids.get(ctx.team_id, self._bot_user_id)
         author_id = original.get("user") or event.get("item_user") or ""
 
-        reactor_ref = f"<@{user_id}>" if user_id else "Someone"
+        reactor_ref = f"<@{ctx.user_id}>" if ctx.user_id else "Someone"
         author_ref = f"<@{author_id}>" if author_id else "someone"
         original_text = (original.get("text") or "").strip()
         quoted = (
@@ -2181,7 +2240,7 @@ class SlackAdapter(BasePlatformAdapter):
             else "> (no text content)"
         )
         summon_text = (
-            f"{reactor_ref} reacted with :{emoji}: to summon you on this "
+            f"{reactor_ref} reacted with :{ctx.emoji}: to summon you on this "
             f"message from {author_ref}:\n{quoted}"
         )
         # Prefix a literal bot mention so the message pipeline treats the
@@ -2191,39 +2250,32 @@ class SlackAdapter(BasePlatformAdapter):
         if bot_uid:
             summon_text = f"<@{bot_uid}> {summon_text}"
 
-        synthetic_event = {
-            "type": "message",
-            "text": summon_text,
-            "user": user_id,
-            "channel": channel_id,
+        synthetic_event = self._build_reaction_synthetic_event(
+            text=summon_text,
+            ctx=ctx,
             # Resolve the real conversation type (im / mpim / channel) so the
             # summon session keys the same as a real message here — a group
             # DM must not be mis-keyed as a public channel.
-            "channel_type": await self._resolve_reaction_channel_type(channel_id),
-            # Unique per reaction event — must NOT be the original message ts,
-            # or the message deduper would suppress summons on messages the
-            # bot already processed.
-            "ts": event.get("event_ts") or "",
+            channel_type=await self._resolve_reaction_channel_type(ctx.channel_id),
             # Force the reply into the reacted message's thread (or the
             # message itself as thread root if it is top-level).
-            "thread_ts": original.get("thread_ts") or message_ts,
-        }
-        if team_id:
-            synthetic_event["team"] = team_id
+            thread_ts=original.get("thread_ts") or ctx.message_ts,
+            event_ts=event.get("event_ts") or "",
+        )
         if original.get("files"):
             synthetic_event["files"] = original["files"]
         # If the reactor is another app/bot, stamp bot_id so the normal
         # allow_bots policy in _handle_slack_message decides whether to
         # honour the summon — an automation reacting must not bypass gating.
-        if await self._reactor_is_bot(user_id, channel_id):
-            synthetic_event["bot_id"] = f"reaction:{user_id}"
+        if await self._reactor_is_bot(ctx.user_id, ctx.channel_id):
+            synthetic_event["bot_id"] = f"reaction:{ctx.user_id}"
 
         logger.info(
             "[Slack] Reaction trigger :%s: by %s summoning on %s/%s",
-            emoji,
-            user_id or "<unknown>",
-            channel_id,
-            message_ts,
+            ctx.emoji,
+            ctx.user_id or "<unknown>",
+            ctx.channel_id,
+            ctx.message_ts,
         )
         await self._handle_slack_message(synthetic_event)
 
@@ -2240,95 +2292,67 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
 
-        trigger_emojis = self._slack_reaction_trigger_emojis()
-        if not trigger_emojis:
+        ctx = self._parse_reaction_event(event)
+        if ctx is None or not ctx.user_id:
             return
 
-        raw_emoji = str(event.get("reaction") or "")
-        emoji = raw_emoji.split("::", 1)[0].strip().strip(":").lower()
-        if not emoji or emoji not in trigger_emojis:
+        # /stop is only meaningful while a turn is running. Bail before the
+        # conversations.info lookup below when nothing is in flight — the
+        # common case for a reaction removal.
+        if not getattr(self, "_active_sessions", None):
             return
 
-        item = event.get("item") or {}
-        if item.get("type") != "message":
-            return
-        channel_id = item.get("channel") or ""
-        message_ts = item.get("ts") or ""
-        if not channel_id or not message_ts:
-            return
+        channel_type = await self._resolve_reaction_channel_type(ctx.channel_id)
 
-        user_id = event.get("user") or ""
-        if not user_id:
-            return
-        # Ignore Hermes' own lifecycle reaction removals (e.g. removing
-        # :eyes: before adding :white_check_mark:).
-        if (
-            user_id == self._bot_user_id
-            or user_id in self._team_bot_user_ids.values()
-        ):
-            return
-
-        team_id = (
-            event.get("team")
-            or event.get("team_id")
-            or self._channel_team.get(channel_id)
-            or ""
-        )
-        if team_id:
-            self._channel_team.setdefault(channel_id, team_id)
-        channel_type = await self._resolve_reaction_channel_type(channel_id)
-
-        thread_ts = message_ts
+        # The reaction may sit on a thread root or on a reply; find the active
+        # thread. Fetch (to learn the parent root) only if the direct hit misses.
+        thread_ts = ctx.message_ts
         if not self._slack_thread_session_is_active(
-            channel_id=channel_id,
+            channel_id=ctx.channel_id,
             thread_ts=thread_ts,
-            user_id=user_id,
+            user_id=ctx.user_id,
             channel_type=channel_type,
         ):
             original, _error_detail = await self._fetch_slack_message_for_reaction(
-                channel_id, message_ts
+                ctx.channel_id, ctx.message_ts
             )
-            fetched_thread_ts = (original or {}).get("thread_ts") or message_ts
-            if fetched_thread_ts == thread_ts or not self._slack_thread_session_is_active(
-                channel_id=channel_id,
-                thread_ts=fetched_thread_ts,
-                user_id=user_id,
+            parent_ts = (original or {}).get("thread_ts")
+            if not parent_ts or parent_ts == thread_ts:
+                return  # top-level message, and its own thread wasn't active
+            if not self._slack_thread_session_is_active(
+                channel_id=ctx.channel_id,
+                thread_ts=parent_ts,
+                user_id=ctx.user_id,
                 channel_type=channel_type,
             ):
                 return
-            thread_ts = fetched_thread_ts
+            thread_ts = parent_ts
 
         # Re-adding the same emoji should be able to summon again after this
         # stop, so clear the summon dedup for this message+emoji.
         self._reaction_summon_dedup.discard(
-            f"{team_id}:{channel_id}:{message_ts}:{emoji}"
+            f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
         )
 
-        bot_uid = (
-            self._team_bot_user_ids.get(team_id) if team_id else None
-        ) or self._bot_user_id
+        bot_uid = self._team_bot_user_ids.get(ctx.team_id, self._bot_user_id)
         stop_text = "/stop"
         if bot_uid:
             # Force mention-gating to admit the control event; _handle_slack_message
             # strips the mention before MessageEvent reaches the gateway.
             stop_text = f"<@{bot_uid}> {stop_text}"
 
-        synthetic_event = {
-            "type": "message",
-            "text": stop_text,
-            "user": user_id,
-            "channel": channel_id,
-            "channel_type": channel_type,
-            "ts": event.get("event_ts") or "",
-            "thread_ts": thread_ts,
-        }
-        if team_id:
-            synthetic_event["team"] = team_id
+        synthetic_event = self._build_reaction_synthetic_event(
+            text=stop_text,
+            ctx=ctx,
+            channel_type=channel_type,
+            thread_ts=thread_ts,
+            event_ts=event.get("event_ts") or "",
+        )
 
         logger.info(
             "[Slack] Reaction removal by %s stopping active thread %s/%s",
-            user_id,
-            channel_id,
+            ctx.user_id,
+            ctx.channel_id,
             thread_ts,
         )
         await self._handle_slack_message(synthetic_event)
@@ -2474,31 +2498,35 @@ class SlackAdapter(BasePlatformAdapter):
         client = self._get_client(channel_id)
         last_error = ""
 
-        try:
-            resp = await client.conversations_replies(
-                channel=channel_id, ts=message_ts, limit=1, inclusive=True
-            )
-            if resp.get("ok", True):
-                for msg in resp.get("messages") or []:
-                    if msg.get("ts") == message_ts:
-                        return msg, ""
-            else:
-                last_error = str(resp.get("error") or "")
-        except Exception as exc:
-            last_error = str(exc)
+        async def _scan(make_call) -> Optional[dict]:
+            # Lazily invoke the API — the fallback call must not be created
+            # (and left un-awaited) when the first lookup already resolved it.
+            nonlocal last_error
+            try:
+                resp = await make_call()
+                if resp.get("ok", True):
+                    for msg in resp.get("messages") or []:
+                        if msg.get("ts") == message_ts:
+                            return msg
+                else:
+                    last_error = str(resp.get("error") or "") or last_error
+            except Exception as exc:
+                last_error = str(exc) or last_error
+            return None
 
-        try:
-            resp = await client.conversations_history(
+        # conversations.replies resolves both top-level and in-thread messages
+        # by their own ts; conversations.history (top-level only) is a fallback.
+        for make_call in (
+            lambda: client.conversations_replies(
+                channel=channel_id, ts=message_ts, limit=1, inclusive=True
+            ),
+            lambda: client.conversations_history(
                 channel=channel_id, latest=message_ts, inclusive=True, limit=1
-            )
-            if resp.get("ok", True):
-                for msg in resp.get("messages") or []:
-                    if msg.get("ts") == message_ts:
-                        return msg, ""
-            else:
-                last_error = str(resp.get("error") or "") or last_error
-        except Exception as exc:
-            last_error = str(exc) or last_error
+            ),
+        ):
+            msg = await _scan(make_call)
+            if msg is not None:
+                return msg, ""
 
         return None, last_error
 
@@ -4478,19 +4506,7 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_id=thread_ts,
             )
 
-            # Read session isolation settings from the store's config
-            store_cfg = getattr(session_store, "config", None)
-            gspu = (
-                getattr(store_cfg, "group_sessions_per_user", True)
-                if store_cfg
-                else True
-            )
-            tspu = (
-                getattr(store_cfg, "thread_sessions_per_user", False)
-                if store_cfg
-                else False
-            )
-
+            gspu, tspu = self._session_isolation_settings()
             session_key = build_session_key(
                 source,
                 group_sessions_per_user=gspu,
