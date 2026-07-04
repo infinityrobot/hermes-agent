@@ -73,6 +73,19 @@ class TestSlackFullManifest:
         assert "message.mpim" in bot_events
         assert "mpim:history" in bot_scopes
 
+    def test_reaction_scopes_and_event_are_included(self):
+        """Reaction triggers (slack.reaction_triggers) need reactions:read +
+        the reaction_added event; lifecycle reactions (SLACK_REACTIONS) need
+        reactions:write."""
+        manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+
+        bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
+        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
+
+        assert "reactions:read" in bot_scopes
+        assert "reactions:write" in bot_scopes
+        assert "reaction_added" in bot_events
+
     def test_assistant_features_remain_enabled(self):
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
 

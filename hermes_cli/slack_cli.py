@@ -78,6 +78,11 @@ def _build_full_manifest(
         "im:write",
         "mpim:history",
         "mpim:read",
+        # reactions:read powers reaction triggers (slack.reaction_triggers);
+        # reactions:write powers the :eyes:/:white_check_mark: lifecycle
+        # reactions (SLACK_REACTIONS).
+        "reactions:read",
+        "reactions:write",
         "users:read",
     ]
 
@@ -87,6 +92,7 @@ def _build_full_manifest(
         "message.groups",
         "message.im",
         "message.mpim",
+        "reaction_added",
     ]
 
     if include_assistant:

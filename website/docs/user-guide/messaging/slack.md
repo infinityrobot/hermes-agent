@@ -81,6 +81,8 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | `users:read` | Look up user information |
 | `files:read` | Read and download attached files, including voice notes/audio |
 | `files:write` | Upload files (images, audio, documents) |
+| `reactions:read` | Receive emoji reactions ([reaction triggers](#reaction-triggers-emoji-summon)) |
+| `reactions:write` | Add `:eyes:`/`:white_check_mark:` lifecycle reactions to messages |
 
 :::caution Missing scopes = missing features
 Without `channels:history` and `groups:history`, the bot **will not receive messages in channels** —
@@ -130,6 +132,7 @@ This step is critical — it controls what messages the bot can see.
 | `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
 | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
 | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
+| `reaction_added` | Optional | Needed for [reaction triggers](#reaction-triggers-emoji-summon) (emoji summon) |
 
 4. Click **Save Changes** at the bottom of the page
 
@@ -417,6 +420,45 @@ Slack supports both patterns: `@mention` required to start a conversation by def
 
 :::caution Group DMs (MPIMs) are shared surfaces, not 1:1 DMs
 A **1:1 direct message** is a private conversation with one person, so it is mention-exempt. A **group DM (MPIM / multi-person DM)** is a *shared surface* — multiple people can see and trigger the bot — so it obeys the same operator controls as a channel: `require_mention`, `strict_mention`, `free_response_channels`, and `allowed_channels` all apply, and the bot only adds `:eyes:`/`:white_check_mark:` reactions when it is actually `@mentioned`. To let the bot respond freely in a specific group DM, add its channel ID (starts with `G`) to `free_response_channels`.
+:::
+
+### Reaction triggers (emoji summon)
+
+Opt-in: summon the bot onto any message by reacting to it with a configured emoji. The bot fetches the reacted message and responds **in that message's thread**, as if the reactor had @mentioned it there.
+
+```yaml
+slack:
+  reaction_triggers:
+    enabled: true        # optional, defaults to true when emojis are set
+    emojis:
+      - hermes           # emoji names without colons
+      - eyes
+```
+
+Shorthand and environment-variable forms are also accepted:
+
+```yaml
+slack:
+  reaction_triggers: [hermes, eyes]
+```
+
+```bash
+# Fallback only — config.yaml takes precedence
+SLACK_REACTION_TRIGGER_EMOJIS=hermes,eyes
+```
+
+Behavior:
+
+- **Off by default.** With no configured emojis, `reaction_added` events are acknowledged and discarded (the pre-existing behavior).
+- **Replies in the thread** of the reacted message (or starts one if the message is top-level), keeping channel noise down.
+- **Once per message** — the first matching reaction summons the bot; other users piling onto the same emoji on the same message do not re-summon it. A different configured emoji on the same message counts as a new summon.
+- **Ignores the bot's own reactions**, so the `:eyes:`/`:white_check_mark:` lifecycle reactions can never self-summon.
+- **Skin-tone variants match** their base emoji (`thumbsup::skin-tone-2` matches `thumbsup`).
+- The reactor is treated as the requesting user, so the normal user allowlist (`SLACK_ALLOWED_USERS`) still applies, and `allowed_channels` still filters which channels the bot will engage in.
+- If the bot **cannot read the message** (not in the channel, missing scope), it attempts to reply in-thread with a short "I don't have access" note instead of failing silently.
+
+:::caution App reinstall required
+Reaction triggers need the `reactions:read` bot scope and the `reaction_added` event subscription. Regenerate the manifest with `hermes slack manifest` (both are now included by default), update your app at [api.slack.com/apps](https://api.slack.com/apps), and **reinstall it to your workspace** for the new scope to take effect.
 :::
 
 ### Channel allowlist (`allowed_channels`)
