@@ -469,6 +469,49 @@ class TestHandleSlackReactionAdded:
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["channel_type"] == "mpim"
 
+    @pytest.mark.asyncio
+    async def test_reaction_on_in_thread_reply_resolves(self):
+        # conversations.replies returns the parent FIRST; the reacted reply is
+        # only in the result because we page the thread (limit > 1).
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        parent_ts = "1751500000.000001"
+        client.conversations_replies.return_value = {
+            "ok": True,
+            "messages": [
+                {"ts": parent_ts, "text": "parent", "user": AUTHOR_ID,
+                 "thread_ts": parent_ts},
+                {"ts": MSG_TS, "text": "the reacted reply", "user": AUTHOR_ID,
+                 "thread_ts": parent_ts},
+            ],
+        }
+        await adapter._handle_slack_reaction_added(_reaction_event())
+
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert "the reacted reply" in synthetic["text"]
+        assert synthetic["thread_ts"] == parent_ts
+        # We must request more than the thread parent alone.
+        assert client.conversations_replies.await_args.kwargs["limit"] > 1
+
+    @pytest.mark.asyncio
+    async def test_channel_type_not_cached_on_transient_failure(self):
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        client.conversations_info.side_effect = Exception("ratelimited")
+
+        first = await adapter._resolve_reaction_channel_type("G12345678")
+        assert first == "channel"  # heuristic fallback for the failing call
+        assert "G12345678" not in adapter._reaction_channel_type  # not poisoned
+
+        # A later reaction retries; info now succeeds and the mpim keys correctly.
+        client.conversations_info.side_effect = None
+        client.conversations_info.return_value = {
+            "ok": True,
+            "channel": {"is_mpim": True},
+        }
+        second = await adapter._resolve_reaction_channel_type("G12345678")
+        assert second == "mpim"
+        assert adapter._reaction_channel_type["G12345678"] == "mpim"
+
 
 class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
@@ -589,4 +632,24 @@ class TestHandleSlackReactionRemoved:
         adapter._handle_slack_message.assert_awaited_once()
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["thread_ts"] == parent_ts
+        assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"
+
+    @pytest.mark.asyncio
+    async def test_stop_falls_back_to_primary_bot_uid_when_team_uid_empty(
+        self, monkeypatch
+    ):
+        # A workspace whose auth_test returned no user_id is stored as "".
+        # bot_uid must fall back to the primary id, or the <@bot> prefix is
+        # dropped and mention-gating rejects the synthetic /stop.
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter._team_bot_user_ids = {"T1": ""}
+        _mark_active_thread(adapter, thread_ts=MSG_TS)
+
+        event = _reaction_removed_event()
+        event["team"] = "T1"
+        await adapter._handle_slack_reaction_removed(event)
+
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"

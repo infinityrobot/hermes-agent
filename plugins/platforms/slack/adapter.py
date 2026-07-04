@@ -434,6 +434,10 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    # When fetching a reacted message we page the thread so a reacted reply
+    # (not just the thread root) is in the result to scan for. Bounded so a
+    # huge thread does not pull an unbounded page.
+    _REACTION_FETCH_THREAD_LIMIT = 200
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
@@ -2228,7 +2232,7 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             return
 
-        bot_uid = self._team_bot_user_ids.get(ctx.team_id, self._bot_user_id)
+        bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
         author_id = original.get("user") or event.get("item_user") or ""
 
         reactor_ref = f"<@{ctx.user_id}>" if ctx.user_id else "Someone"
@@ -2244,9 +2248,12 @@ class SlackAdapter(BasePlatformAdapter):
             f"message from {author_ref}:\n{quoted}"
         )
         # Prefix a literal bot mention so the message pipeline treats the
-        # summon as an explicit @mention (passes mention gating, earns the
-        # reaction lifecycle, registers the thread). The pipeline strips it
-        # from the text the agent sees.
+        # summon as an explicit @mention (passes mention gating, registers the
+        # thread). The pipeline strips it from the text the agent sees.
+        # NOTE: the :eyes:/:white_check_mark: reaction lifecycle does NOT apply
+        # here — the synthetic event's ts is the reaction event_ts, not a real
+        # message ts, so any reactions.add against it would no-op. The threaded
+        # reply is the acknowledgement instead.
         if bot_uid:
             summon_text = f"<@{bot_uid}> {summon_text}"
 
@@ -2334,7 +2341,7 @@ class SlackAdapter(BasePlatformAdapter):
             f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
         )
 
-        bot_uid = self._team_bot_user_ids.get(ctx.team_id, self._bot_user_id)
+        bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
         stop_text = "/stop"
         if bot_uid:
             # Force mention-gating to admit the control event; _handle_slack_message
@@ -2429,32 +2436,41 @@ class SlackAdapter(BasePlatformAdapter):
         summon/stop event keys its session (and hits mention gating) exactly
         as a real message in that conversation would. Slack channel-ID
         prefixes are ambiguous (``G`` covers both private channels and legacy
-        group DMs), so this consults ``conversations.info`` once per channel
-        and caches the result; on failure it falls back to the ``D``-prefix
-        heuristic and treats everything else as a channel.
+        group DMs), so this consults ``conversations.info`` once per channel.
+        Only a successful lookup is cached — a transient failure falls back to
+        the ``D``-prefix heuristic for this call but is NOT cached, so the next
+        reaction retries instead of mis-keying the conversation's sessions for
+        the whole process lifetime.
         """
         cached = self._reaction_channel_type.get(channel_id)
         if cached is not None:
             return cached
 
-        resolved = "im" if channel_id.startswith("D") else "channel"
         try:
             resp = await self._get_client(channel_id).conversations_info(
                 channel=channel_id
             )
-            chan = (resp.get("channel") or {}) if resp.get("ok", True) else {}
-            if chan.get("is_im"):
-                resolved = "im"
-            elif chan.get("is_mpim"):
-                resolved = "mpim"
-            else:
-                resolved = "channel"
+            if resp.get("ok", True):
+                chan = resp.get("channel") or {}
+                if chan.get("is_im"):
+                    resolved = "im"
+                elif chan.get("is_mpim"):
+                    resolved = "mpim"
+                else:
+                    resolved = "channel"
+                self._reaction_channel_type[channel_id] = resolved
+                return resolved
+            logger.debug(
+                "[Slack] conversations.info not ok for %s: %s",
+                channel_id,
+                resp.get("error"),
+            )
         except Exception as exc:
             logger.debug(
                 "[Slack] conversations.info failed for %s: %s", channel_id, exc
             )
-        self._reaction_channel_type[channel_id] = resolved
-        return resolved
+        # Uncached heuristic fallback — retried on the next reaction.
+        return "im" if channel_id.startswith("D") else "channel"
 
     async def _reactor_is_bot(self, user_id: str, channel_id: str = "") -> bool:
         """Return whether a reacting user is another app/bot, cached.
@@ -2491,9 +2507,10 @@ class SlackAdapter(BasePlatformAdapter):
         the message cannot be read (missing scope, bot not in channel, …).
 
         ``conversations.replies`` resolves both top-level messages and
-        in-thread replies when given the message's own ts, so try it first;
-        ``conversations.history`` only matches top-level messages and serves
-        as a fallback.
+        in-thread replies when given a ts in the thread, but it returns the
+        thread parent FIRST — so a reacted reply is only present if we request
+        more than one message. We page the thread and scan for the exact ts.
+        ``conversations.history`` (top-level only) is the fallback.
         """
         client = self._get_client(channel_id)
         last_error = ""
@@ -2514,11 +2531,14 @@ class SlackAdapter(BasePlatformAdapter):
                 last_error = str(exc) or last_error
             return None
 
-        # conversations.replies resolves both top-level and in-thread messages
-        # by their own ts; conversations.history (top-level only) is a fallback.
         for make_call in (
             lambda: client.conversations_replies(
-                channel=channel_id, ts=message_ts, limit=1, inclusive=True
+                # Page the thread (parent + replies) so a reacted reply — not
+                # just the thread root — is in the result to scan for.
+                channel=channel_id,
+                ts=message_ts,
+                limit=self._REACTION_FETCH_THREAD_LIMIT,
+                inclusive=True,
             ),
             lambda: client.conversations_history(
                 channel=channel_id, latest=message_ts, inclusive=True, limit=1
