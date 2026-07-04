@@ -133,6 +133,7 @@ This step is critical — it controls what messages the bot can see.
 | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
 | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
 | `reaction_added` | Optional | Needed for [reaction triggers](#reaction-triggers-emoji-summon) (emoji summon) |
+| `reaction_removed` | Optional | Needed for remove-the-emoji-to-stop (part of [reaction triggers](#reaction-triggers-emoji-summon)) |
 
 4. Click **Save Changes** at the bottom of the page
 
@@ -454,11 +455,12 @@ Behavior:
 - **Once per message** — the first matching reaction summons the bot; other users piling onto the same emoji on the same message do not re-summon it. A different configured emoji on the same message counts as a new summon.
 - **Ignores the bot's own reactions**, so the `:eyes:`/`:white_check_mark:` lifecycle reactions can never self-summon.
 - **Skin-tone variants match** their base emoji (`thumbsup::skin-tone-2` matches `thumbsup`).
-- The reactor is treated as the requesting user, so the normal user allowlist (`SLACK_ALLOWED_USERS`) still applies, and `allowed_channels` still filters which channels the bot will engage in.
-- If the bot **cannot read the message** (not in the channel, missing scope), it attempts to reply in-thread with a short "I don't have access" note instead of failing silently.
+- The reactor is treated as the requesting user, so the normal user allowlist (`SLACK_ALLOWED_USERS`) still applies, `allowed_channels` still filters which channels the bot will engage in, and reactions from **other apps/bots** are subject to your `allow_bots` policy (they do not bypass it).
+- If the bot **cannot read the message** (not in the channel, missing scope), it replies in-thread with a short "I don't have access" note. The summon is *not* consumed, so after you invite the bot, re-adding the same emoji works.
+- **Remove the emoji to stop.** Removing a trigger emoji from a message whose turn is still running is treated as `/stop` for that thread — a quick way to cancel a summon you didn't mean. This also clears the once-per-message guard, so re-adding the emoji can summon again. (Requires the `reaction_removed` event; gated by the same `slack.reactions` toggle as the `:eyes:`/`:white_check_mark:` lifecycle reactions.)
 
 :::caution App reinstall required
-Reaction triggers need the `reactions:read` bot scope and the `reaction_added` event subscription. Regenerate the manifest with `hermes slack manifest` (both are now included by default), update your app at [api.slack.com/apps](https://api.slack.com/apps), and **reinstall it to your workspace** for the new scope to take effect.
+Reaction triggers need the `reactions:read` bot scope and the `reaction_added` event subscription (plus `reaction_removed` for the remove-to-stop behavior). Regenerate the manifest with `hermes slack manifest` (all included by default), update your app at [api.slack.com/apps](https://api.slack.com/apps), and **reinstall it to your workspace** for the new scope to take effect.
 :::
 
 ### Channel allowlist (`allowed_channels`)

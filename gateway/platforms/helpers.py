@@ -70,6 +70,15 @@ class MessageDeduplicator:
                 self._seen = dict(newest)
         return False
 
+    def discard(self, msg_id: str) -> None:
+        """Forget *msg_id* so its next occurrence is treated as new.
+
+        Use when a recorded id turns out not to have been handled after all
+        (e.g. a fetch failed and the caller wants a later retry to go
+        through), so ``is_duplicate`` does not permanently suppress it.
+        """
+        self._seen.pop(msg_id, None)
+
     def clear(self):
         """Clear all tracked messages."""
         self._seen.clear()

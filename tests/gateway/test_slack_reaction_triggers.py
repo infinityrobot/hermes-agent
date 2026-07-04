@@ -49,6 +49,7 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
+from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
 from plugins.platforms.slack.adapter import (  # noqa: E402
     SlackAdapter,
     _apply_yaml_config,
@@ -80,8 +81,11 @@ def _make_adapter(reaction_triggers=None):
     adapter._team_bot_user_ids = {}
     adapter._team_clients = {}
     adapter._channel_team = {}
-    adapter._reaction_summons_seen = set()
-    adapter._REACTION_SUMMONS_MAX = 5000
+    adapter._reaction_summon_dedup = MessageDeduplicator(max_size=5000)
+    adapter._reaction_channel_type = {}
+    adapter._reactor_is_bot_cache = {}
+    adapter._active_sessions = {}
+    adapter._session_store = None
 
     client = MagicMock()
     client.conversations_replies = AsyncMock(
@@ -95,12 +99,53 @@ def _make_adapter(reaction_triggers=None):
     client.conversations_history = AsyncMock(
         return_value={"ok": True, "messages": []}
     )
+
+    def _conv_info(channel, **_kw):
+        # Classify by ID prefix so tests exercise im / mpim / channel keying:
+        # D → 1:1 DM, G → group DM (mpim), everything else → channel.
+        chan = {"is_im": channel.startswith("D"), "is_mpim": channel.startswith("G")}
+        return {"ok": True, "channel": chan}
+
+    client.conversations_info = AsyncMock(side_effect=_conv_info)
+    client.users_info = AsyncMock(
+        return_value={"ok": True, "user": {"is_bot": False}}
+    )
     client.chat_postMessage = AsyncMock(return_value={"ok": True})
     adapter._app = MagicMock()
     adapter._app.client = client
 
     adapter._handle_slack_message = AsyncMock()
     return adapter, client
+
+
+def _mark_active_thread(
+    adapter,
+    *,
+    channel=CHANNEL_ID,
+    thread_ts=MSG_TS,
+    user=REACTOR_ID,
+    channel_type="channel",
+):
+    from gateway.session import build_session_key
+
+    source = adapter.build_source(
+        chat_id=channel,
+        chat_name=channel,
+        chat_type="dm" if channel_type in {"im", "mpim"} else "group",
+        user_id=user,
+        thread_id=thread_ts,
+    )
+    key = build_session_key(
+        source,
+        group_sessions_per_user=adapter.config.extra.get(
+            "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=adapter.config.extra.get(
+            "thread_sessions_per_user", False
+        ),
+    )
+    adapter._active_sessions[key] = object()
+    return key
 
 
 def _reaction_event(
@@ -118,6 +163,13 @@ def _reaction_event(
         "item_user": AUTHOR_ID,
         "event_ts": EVENT_TS,
     }
+
+
+def _reaction_removed_event(**kwargs):
+    event = _reaction_event(**kwargs)
+    event["type"] = "reaction_removed"
+    event["event_ts"] = "1751600200.000300"
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -376,3 +428,150 @@ class TestHandleSlackReactionAdded:
         await adapter._handle_slack_reaction_added(_reaction_event())
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["files"] == files
+
+    @pytest.mark.asyncio
+    async def test_foreign_bot_reactor_is_gated(self):
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        client.users_info.return_value = {"ok": True, "user": {"is_bot": True}}
+
+        await adapter._handle_slack_reaction_added(_reaction_event(user="U_OTHER_BOT"))
+
+        # Summon still replays, but stamped with bot_id so _handle_slack_message's
+        # allow_bots policy decides — it does not silently bypass gating.
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic.get("bot_id")
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_can_be_retried(self):
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        # First attempt: fetch fails on both paths → access notice, no summon.
+        client.conversations_replies.side_effect = Exception("not_in_channel")
+        client.conversations_history.side_effect = Exception("not_in_channel")
+        await adapter._handle_slack_reaction_added(_reaction_event())
+        adapter._handle_slack_message.assert_not_awaited()
+
+        # Bot invited; user re-reacts with the same emoji on the same message.
+        client.conversations_replies.side_effect = None
+        client.conversations_replies.return_value = {
+            "ok": True,
+            "messages": [{"ts": MSG_TS, "text": "now visible", "user": AUTHOR_ID}],
+        }
+        await adapter._handle_slack_reaction_added(_reaction_event())
+        adapter._handle_slack_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mpim_channel_type_resolved(self):
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        await adapter._handle_slack_reaction_added(
+            _reaction_event(channel="G12345678")
+        )
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["channel_type"] == "mpim"
+
+
+class TestHandleSlackReactionRemoved:
+    @pytest.mark.asyncio
+    async def test_reactions_disabled_ignores_stop_trigger(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        _mark_active_thread(adapter)
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_trigger_emoji_removal_ignored(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        _mark_active_thread(adapter)
+
+        await adapter._handle_slack_reaction_removed(
+            _reaction_removed_event(reaction="thumbsup")
+        )
+
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_removal_disabled_when_no_triggers(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS", raising=False)
+        adapter, client = _make_adapter()  # no reaction_triggers
+        _mark_active_thread(adapter)
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_active_top_level_thread_synthesizes_stop(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        _mark_active_thread(adapter)
+        summon_key = f":{CHANNEL_ID}:{MSG_TS}:hermes"
+        adapter._reaction_summon_dedup.is_duplicate(summon_key)  # record it
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["channel"] == CHANNEL_ID
+        assert synthetic["user"] == REACTOR_ID
+        assert synthetic["thread_ts"] == MSG_TS
+        assert synthetic["ts"] == "1751600200.000300"
+        assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"
+        # Stop cleared the summon dedup so re-adding the emoji can summon again.
+        assert not adapter._reaction_summon_dedup.is_duplicate(summon_key)
+
+    @pytest.mark.asyncio
+    async def test_inactive_thread_ignored(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        adapter._handle_slack_message.assert_not_awaited()
+        client.conversations_replies.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bots_own_reaction_removal_ignored(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        _mark_active_thread(adapter)
+
+        await adapter._handle_slack_reaction_removed(
+            _reaction_removed_event(user=BOT_USER_ID)
+        )
+
+        client.conversations_replies.assert_not_awaited()
+        adapter._handle_slack_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_threaded_message_removal_stops_parent_thread(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        parent_ts = "1751500000.000001"
+        _mark_active_thread(adapter, thread_ts=parent_ts)
+        client.conversations_replies.return_value = {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": MSG_TS,
+                    "thread_ts": parent_ts,
+                    "text": "threaded reply",
+                    "user": AUTHOR_ID,
+                }
+            ],
+        }
+
+        await adapter._handle_slack_reaction_removed(_reaction_removed_event())
+
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["thread_ts"] == parent_ts
+        assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"

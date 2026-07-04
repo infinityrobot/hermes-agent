@@ -85,6 +85,7 @@ class TestSlackFullManifest:
         assert "reactions:read" in bot_scopes
         assert "reactions:write" in bot_scopes
         assert "reaction_added" in bot_events
+        assert "reaction_removed" in bot_events
 
     def test_assistant_features_remain_enabled(self):
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")

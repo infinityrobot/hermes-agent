@@ -93,6 +93,7 @@ def _build_full_manifest(
         "message.im",
         "message.mpim",
         "reaction_added",
+        "reaction_removed",
     ]
 
     if include_assistant:
