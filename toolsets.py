@@ -61,6 +61,10 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Agent-initiated emoji reactions (react to the current message instead of
+    # replying). Only functional on the gateway (react_callback) and when the
+    # adapter opts in (e.g. slack.agent_reactions); inert elsewhere.
+    "react",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -235,7 +239,13 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
-    
+
+    "react": {
+        "description": "React to the current message with an emoji instead of replying (gateway + opt-in adapter only)",
+        "tools": ["react"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],

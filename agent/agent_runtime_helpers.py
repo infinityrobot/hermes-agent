@@ -2248,6 +2248,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "react":
+        def _execute(next_args: dict) -> Any:
+            from tools.react_tool import react_tool as _react_tool
+            return _finish_agent_tool(
+                _react_tool(
+                    emoji=next_args.get("emoji", ""),
+                    message_id=next_args.get("message_id"),
+                    remove=bool(next_args.get("remove", False)),
+                    callback=getattr(agent, "react_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "read_terminal":
         def _execute(next_args: dict) -> Any:
             from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool

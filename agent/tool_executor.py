@@ -1268,6 +1268,26 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+        elif function_name == "react":
+            def _execute(next_args: dict) -> Any:
+                from tools.react_tool import react_tool as _react_tool
+                return _react_tool(
+                    emoji=next_args.get("emoji", ""),
+                    message_id=next_args.get("message_id"),
+                    remove=bool(next_args.get("remove", False)),
+                    callback=getattr(agent, "react_callback", None),
+                )
+            function_result, function_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('react', function_args, tool_duration, result=function_result)}")
         elif function_name == "read_terminal":
             def _execute(next_args: dict) -> Any:
                 from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
