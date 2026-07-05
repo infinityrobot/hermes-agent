@@ -71,10 +71,12 @@ MSG_TS = "1751600000.000100"
 EVENT_TS = "1751600100.000200"
 
 
-def _make_adapter(reaction_trigger_emojis=None):
+def _make_adapter(reaction_trigger_emojis=None, agent_reactions=None):
     extra = {}
     if reaction_trigger_emojis is not None:
         extra["reaction_trigger_emojis"] = reaction_trigger_emojis
+    if agent_reactions is not None:
+        extra["agent_reactions"] = agent_reactions
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -88,6 +90,7 @@ def _make_adapter(reaction_trigger_emojis=None):
     adapter._reactor_is_bot_cache = {}
     adapter._reaction_lifecycle_target = {}
     adapter._reacting_message_ids = set()
+    adapter._last_inbound_ts = {}
     adapter._active_sessions = {}
     adapter._session_store = None
 
@@ -812,3 +815,79 @@ class TestReactionSummonLifecycle:
         await adapter.on_processing_complete(ev, ProcessingOutcome.FAILURE)
         adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "hourglass")
         adapter._add_reaction.assert_awaited_with(CHANNEL_ID, MSG_TS, "boom")
+
+
+class TestAgentReactions:
+    """Agent-initiated reactions (slack.agent_reactions) — the public
+    add_reaction/remove_reaction the gateway react tool dispatches to."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("SLACK_AGENT_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter._add_reaction = AsyncMock(return_value=True)
+        result = await adapter.add_reaction(CHANNEL_ID, "tada", message_id=MSG_TS)
+        assert result["success"] is False
+        adapter._add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enabled_reacts_on_explicit_message(self):
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        result = await adapter.add_reaction(CHANNEL_ID, ":tada:", message_id=MSG_TS)
+        assert result["success"] is True
+        # colon-stripped emoji, correct target
+        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_last_inbound_message(self):
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._last_inbound_ts[CHANNEL_ID] = MSG_TS
+        result = await adapter.add_reaction(CHANNEL_ID, "eyes")
+        assert result["success"] is True
+        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+
+    @pytest.mark.asyncio
+    async def test_no_target_message_errors(self):
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        result = await adapter.add_reaction(CHANNEL_ID, "eyes")  # no last-inbound
+        assert result["success"] is False
+        adapter._add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_env_toggle(self, monkeypatch):
+        monkeypatch.setenv("SLACK_AGENT_REACTIONS", "true")
+        adapter, _ = _make_adapter()  # not set in config → env wins
+        adapter._add_reaction = AsyncMock(return_value=True)
+        result = await adapter.add_reaction(CHANNEL_ID, "eyes", message_id=MSG_TS)
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_remove_named_emoji(self):
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        result = await adapter.remove_reaction(CHANNEL_ID, message_id=MSG_TS, emoji="tada")
+        assert result["success"] is True
+        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+
+    @pytest.mark.asyncio
+    async def test_remove_without_emoji_removes_bots_own(self, monkeypatch):
+        adapter, client = _make_adapter(agent_reactions=True)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        client.reactions_get = AsyncMock(
+            return_value={
+                "ok": True,
+                "message": {
+                    "reactions": [
+                        {"name": "eyes", "users": [BOT_USER_ID]},
+                        {"name": "tada", "users": ["U_SOMEONE_ELSE"]},
+                    ]
+                },
+            }
+        )
+        result = await adapter.remove_reaction(CHANNEL_ID, message_id=MSG_TS)
+        assert result["success"] is True
+        # Only the bot's own reaction (eyes) is removed, not someone else's tada.
+        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")

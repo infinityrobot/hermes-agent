@@ -490,6 +490,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        # Most-recent inbound (real) message ts per channel, so agent-initiated
+        # reactions can default to "the message being replied to".
+        self._last_inbound_ts: Dict[str, str] = {}
         # Reaction-summon dedup: once per team:channel:ts:emoji, so a pile-on
         # of the same emoji (or a Socket Mode redelivery) only summons once.
         # Uses the shared TTL/bounded helper (correct oldest-first eviction);
@@ -2080,6 +2083,100 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.remove failed (%s): %s", emoji, e)
             return False
 
+    # ----- Agent-initiated reactions (opt-in) -----
+
+    def _agent_reactions_enabled(self) -> bool:
+        """Whether the agent may react to messages on its own (opt-in).
+
+        Independent of ``slack.reactions`` (which governs the automatic
+        in-progress/done status markers): this gates deliberate reactions the
+        agent chooses as a form of communication. Default off. Reads
+        ``slack.agent_reactions`` / ``SLACK_AGENT_REACTIONS``.
+        """
+        configured = self.config.extra.get("agent_reactions") if self.config.extra else None
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_AGENT_REACTIONS", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    async def add_reaction(
+        self, chat_id: str, emoji: str, message_id: Optional[str] = None
+    ) -> dict:
+        """Agent-facing: add an emoji reaction to a message.
+
+        Public entry point invoked by the gateway react tool. ``message_id``
+        defaults to the most recent inbound message in ``chat_id`` (the one
+        being replied to). Gated by ``agent_reactions`` — independent of the
+        status-marker toggle.
+        """
+        if not self._agent_reactions_enabled():
+            return {
+                "success": False,
+                "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
+            }
+        ts = message_id or self._last_inbound_ts.get(chat_id)
+        if not ts:
+            return {
+                "success": False,
+                "error": "No target message; pass message_id.",
+            }
+        name = str(emoji or "").strip().strip(":")
+        if not name:
+            return {"success": False, "error": "emoji is required."}
+        ok = await self._add_reaction(chat_id, ts, name)
+        return {"success": ok, "channel": chat_id, "ts": ts, "emoji": name}
+
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: Optional[str] = None,
+        emoji: Optional[str] = None,
+    ) -> dict:
+        """Agent-facing: retract a reaction.
+
+        With ``emoji`` given, removes that one; otherwise removes the bot's own
+        reactions on the target message (Slack requires naming the emoji, so we
+        look them up). ``message_id`` defaults to the most recent inbound
+        message in ``chat_id``.
+        """
+        if not self._agent_reactions_enabled():
+            return {
+                "success": False,
+                "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
+            }
+        ts = message_id or self._last_inbound_ts.get(chat_id)
+        if not ts:
+            return {"success": False, "error": "No target message; pass message_id."}
+
+        names = []
+        if emoji:
+            names = [str(emoji).strip().strip(":")]
+        else:
+            # No emoji named — remove whatever this bot reacted with.
+            try:
+                resp = await self._get_client(chat_id).reactions_get(
+                    channel=chat_id, timestamp=ts
+                )
+                bot_uid = self._bot_user_id
+                for r in ((resp.get("message") or {}).get("reactions")) or []:
+                    if bot_uid and bot_uid in (r.get("users") or []):
+                        names.append(r.get("name"))
+            except Exception as exc:
+                logger.debug("[Slack] reactions.get failed for %s: %s", chat_id, exc)
+        if not names:
+            return {"success": False, "error": "No matching reaction to remove."}
+        removed = 0
+        for name in names:
+            if name and await self._remove_reaction(chat_id, ts, name):
+                removed += 1
+        return {"success": removed > 0, "channel": chat_id, "ts": ts, "removed": removed}
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
@@ -2233,6 +2330,10 @@ class SlackAdapter(BasePlatformAdapter):
             "channel_type": channel_type,
             "ts": event_ts,
             "thread_ts": thread_ts,
+            # Marks a reaction-driven replay so downstream logic (e.g.
+            # last-inbound tracking) can tell it from a real user message —
+            # its ts is a reaction event_ts, not a posted message.
+            "_reaction_synthetic": True,
         }
         if ctx.team_id:
             synthetic["team"] = ctx.team_id
@@ -3350,6 +3451,11 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
+        # Remember the latest real inbound message per channel so agent-initiated
+        # reactions can default to "the message being replied to". Skip synthetic
+        # reaction replays (their ts is a reaction event_ts, not a posted message).
+        if channel_id and ts and not event.get("_reaction_synthetic"):
+            self._last_inbound_ts[channel_id] = ts
         assistant_meta = self._lookup_assistant_thread_metadata(
             event,
             channel_id=channel_id,
@@ -5182,6 +5288,8 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+    if "agent_reactions" in slack_cfg and not os.getenv("SLACK_AGENT_REACTIONS"):
+        os.environ["SLACK_AGENT_REACTIONS"] = str(slack_cfg["agent_reactions"]).lower()
     rt = slack_cfg.get("reaction_trigger_emojis")
     if rt is not None and not os.getenv("SLACK_REACTION_TRIGGER_EMOJIS"):
         rt_emojis = _parse_reaction_trigger_emojis(rt)
@@ -5231,8 +5339,9 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, reaction_trigger_emojis,
-        # reaction_status_emojis, allowed_channels) into SLACK_*
+        # free_response_channels, reactions, agent_reactions,
+        # reaction_trigger_emojis, reaction_status_emojis, allowed_channels)
+        # into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,
