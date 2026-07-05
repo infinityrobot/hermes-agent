@@ -54,7 +54,6 @@ from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
 from plugins.platforms.slack.adapter import (  # noqa: E402
     SlackAdapter,
     _apply_yaml_config,
-    _is_bare_acknowledgement,
     _parse_reaction_status_emojis,
     _parse_reaction_trigger_emojis,
 )
@@ -92,7 +91,6 @@ def _make_adapter(reaction_trigger_emojis=None, agent_reactions=None):
     adapter._reaction_lifecycle_target = {}
     adapter._reacting_message_ids = set()
     adapter._last_inbound_ts = {}
-    adapter._recent_agent_reaction = {}
     adapter._active_sessions = {}
     adapter._session_store = None
 
@@ -893,56 +891,3 @@ class TestAgentReactions:
         assert result["success"] is True
         # Only the bot's own reaction (eyes) is removed, not someone else's tada.
         adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
-
-
-class TestBareAcknowledgement:
-    def test_bare_confirmations_match(self):
-        for t in ["Done.", "done", "ok", "OK!", "Got it.", "sure", "👍", ":tada:",
-                  ":+1: :tada:", "Reacted with :bike:", "Done, reacted with :bike:",
-                  "reacted 🎉", ""]:
-            assert _is_bare_acknowledgement(t), t
-
-    def test_substantive_replies_do_not_match(self):
-        for t in ["Standup is at 9:30am.", "Here's the link: https://x/y",
-                  "Done — deployed to prod at 2:15pm.",
-                  "Yes, but watch the timeout on step 3.",
-                  "The report is finalized; three items still need sign-off."]:
-            assert not _is_bare_acknowledgement(t), t
-
-
-class TestReactionAckSuppression:
-    @pytest.mark.asyncio
-    async def test_reaction_arms_suppression_of_bare_reply(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "bike", message_id=MSG_TS)
-        # A bare "Done, reacted with :bike:" is suppressed...
-        assert adapter._consume_reaction_ack_suppression(
-            CHANNEL_ID, "Done, reacted with :bike:"
-        )
-
-    @pytest.mark.asyncio
-    async def test_suppression_is_one_shot(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "bike", message_id=MSG_TS)
-        assert adapter._consume_reaction_ack_suppression(CHANNEL_ID, "Done.")
-        # Flag consumed — a later bare reply is NOT suppressed.
-        assert not adapter._consume_reaction_ack_suppression(CHANNEL_ID, "Done.")
-
-    @pytest.mark.asyncio
-    async def test_substantive_reply_not_suppressed_and_consumes_flag(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "pray", message_id=MSG_TS)
-        # Real follow-up passes through...
-        assert not adapter._consume_reaction_ack_suppression(
-            CHANNEL_ID, "Standup is at 9:30am."
-        )
-        # ...and the flag is consumed, so a subsequent bare reply is kept too.
-        assert not adapter._consume_reaction_ack_suppression(CHANNEL_ID, "Done.")
-
-    def test_no_reaction_means_no_suppression(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        # No reaction performed → a plain "Done." is never suppressed.
-        assert not adapter._consume_reaction_ack_suppression(CHANNEL_ID, "Done.")

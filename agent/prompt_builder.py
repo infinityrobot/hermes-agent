@@ -328,6 +328,23 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Reaction-as-response guidance — only added to the prompt when the agent has
+# the ``react`` tool available (messaging gateways). It is an explicit
+# exception to TASK_COMPLETION_GUIDANCE above: "report what you did" does NOT
+# apply to a reaction, which is itself the response. Without this carve-out
+# models (especially completion-summary-prone ones) tack a redundant "Done" /
+# "reacted with :x:" onto a reaction.
+REACTION_RESPONSE_GUIDANCE = (
+    "# Reacting is a complete response\n"
+    "When you add an emoji reaction to a message, that reaction IS your full "
+    "response for that turn — do not also send a text message. This is an "
+    "explicit exception to the task-completion guidance above: a reaction "
+    "needs no report, confirmation, or narration. Never follow a reaction with "
+    "'Done', 'ok', 'got it', or a line naming the emoji you used. Send a "
+    "message only when it carries new, substantive information the reaction "
+    "itself cannot convey."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

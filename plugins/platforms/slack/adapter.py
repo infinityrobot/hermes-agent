@@ -438,9 +438,6 @@ class SlackAdapter(BasePlatformAdapter):
     # (not just the thread root) is in the result to scan for. Bounded so a
     # huge thread does not pull an unbounded page.
     _REACTION_FETCH_THREAD_LIMIT = 200
-    # Window in which a bare acknowledgement reply is dropped after an agent
-    # reaction (same-turn suppression; generous enough for long tool turns).
-    _REACTION_ACK_WINDOW_S = 120.0
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
@@ -496,10 +493,6 @@ class SlackAdapter(BasePlatformAdapter):
         # Most-recent inbound (real) message ts per channel, so agent-initiated
         # reactions can default to "the message being replied to".
         self._last_inbound_ts: Dict[str, str] = {}
-        # chat_id → monotonic time of the last successful agent reaction, so a
-        # bare acknowledgement reply in the same turn can be suppressed (the
-        # reaction is the response). One-shot: consumed by the next send().
-        self._recent_agent_reaction: Dict[str, float] = {}
         # Reaction-summon dedup: once per team:channel:ts:emoji, so a pile-on
         # of the same emoji (or a Socket Mode redelivery) only summons once.
         # Uses the shared TTL/bounded helper (correct oldest-first eviction);
@@ -1410,20 +1403,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
-        # Deterministic backstop for agent reactions: if this turn already
-        # reacted, drop a bare acknowledgement reply ("Done.", "Reacted with
-        # :bike:", "ok", a lone emoji) so a reaction stays a reaction. A
-        # substantive follow-up (a real answer, link, detail) does not match
-        # and is sent normally.
-        if self._consume_reaction_ack_suppression(chat_id, content):
-            logger.info(
-                "[Slack] Suppressed bare acknowledgement after agent reaction "
-                "in %s: %r",
-                chat_id,
-                content[:80],
-            )
-            return SendResult(success=True, message_id=None)
-
         try:
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
@@ -2151,26 +2130,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not name:
             return {"success": False, "error": "emoji is required."}
         ok = await self._add_reaction(chat_id, ts, name)
-        if ok:
-            # Arm the one-shot ack-suppression backstop for this chat.
-            self._recent_agent_reaction[chat_id] = time.monotonic()
         return {"success": ok, "channel": chat_id, "ts": ts, "emoji": name}
-
-    def _consume_reaction_ack_suppression(self, chat_id: str, content: str) -> bool:
-        """Return True if ``content`` is a bare acknowledgement that should be
-        dropped because the agent just reacted in this chat.
-
-        One-shot: the recent-reaction marker is consumed on the first send()
-        after a reaction, whether or not the message is suppressed — so it only
-        ever affects the immediately following reply, and a substantive
-        follow-up clears it without being dropped.
-        """
-        ts = self._recent_agent_reaction.pop(chat_id, None)
-        if ts is None:
-            return False
-        if (time.monotonic() - ts) > self._REACTION_ACK_WINDOW_S:
-            return False
-        return _is_bare_acknowledgement(content)
 
     async def remove_reaction(
         self,
@@ -5226,41 +5186,6 @@ def interactive_setup() -> None:
     home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
     if home_channel:
         save_env_value("SLACK_HOME_CHANNEL", home_channel.strip())
-
-
-_BARE_ACK_WORDS = re.compile(
-    r"^(done|ok|okay|kk|sure|noted|got it|will do|np|no problem|"
-    r"thanks|thank you|cool|great|sounds good|yep|yes|no)$"
-)
-
-
-def _is_bare_acknowledgement(text: str) -> bool:
-    """Whether ``text`` is a content-free acknowledgement — the kind of reply
-    that adds nothing once the agent has already reacted.
-
-    Deliberately tight: matches short greetings/confirmations, lone
-    emoji/``:shortcode:`` runs, and "reacted with :x:"-style narration. Any
-    message carrying real information (a time, a link, a sentence) fails to
-    match and is sent normally.
-    """
-    if not text:
-        return True  # nothing to send anyway
-    t = text.strip()
-    if len(t) > 64:
-        return False
-    # Strip Slack/markdown emphasis and a leading bot mention.
-    core = re.sub(r"<@[^>]+>", "", t)
-    core = re.sub(r"[*_~`]", "", core).strip()
-    # Lone emoji / shortcode run (e.g. "👍", ":tada:", ":+1: :tada:").
-    if re.fullmatch(r"(:[a-z0-9_+\-]+:|\s|[^\w\s.,!…])+", core):
-        return True
-    # "reacted", "reacted with :bike:", "done, reacted with :bike:", "reacted 🎉"
-    if re.match(r"^(done|ok|okay|sure)?[\s,.!]*reacted\b", core, re.IGNORECASE):
-        return True
-    # Bare confirmation word(s), ignoring trailing punctuation / a lone emoji.
-    stripped = re.sub(r"[\s.!…]+$", "", core.lower())
-    stripped = re.sub(r"\s*(:[a-z0-9_+\-]+:|[^\w\s])+$", "", stripped).strip()
-    return bool(_BARE_ACK_WORDS.fullmatch(stripped))
 
 
 def _parse_reaction_trigger_emojis(raw) -> set:
