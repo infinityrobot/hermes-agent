@@ -49,10 +49,12 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
+from gateway.platforms.base import ProcessingOutcome  # noqa: E402
 from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
 from plugins.platforms.slack.adapter import (  # noqa: E402
     SlackAdapter,
     _apply_yaml_config,
+    _parse_reaction_emojis,
     _parse_reaction_trigger_emojis,
 )
 
@@ -84,6 +86,8 @@ def _make_adapter(reaction_triggers=None):
     adapter._reaction_summon_dedup = MessageDeduplicator(max_size=5000)
     adapter._reaction_channel_type = {}
     adapter._reactor_is_bot_cache = {}
+    adapter._reaction_lifecycle_target = {}
+    adapter._reacting_message_ids = set()
     adapter._active_sessions = {}
     adapter._session_store = None
 
@@ -209,6 +213,69 @@ class TestParseReactionTriggerEmojis:
 
     def test_scalar_garbage(self):
         assert _parse_reaction_trigger_emojis(42) == set()
+
+
+class TestParseReactionEmojis:
+    DEFAULTS = {"in_progress": "eyes", "done": "white_check_mark", "failed": "x"}
+
+    def test_none_and_empty_return_defaults(self):
+        assert _parse_reaction_emojis(None) == self.DEFAULTS
+        assert _parse_reaction_emojis("") == self.DEFAULTS
+        assert _parse_reaction_emojis({}) == self.DEFAULTS
+
+    def test_full_mapping(self):
+        raw = {"in_progress": "hourglass", "done": "tada", "failed": "boom"}
+        assert _parse_reaction_emojis(raw) == raw
+
+    def test_partial_mapping_merges_over_defaults(self):
+        assert _parse_reaction_emojis({"done": "tada"}) == {
+            "in_progress": "eyes",
+            "done": "tada",
+            "failed": "x",
+        }
+
+    def test_colons_stripped(self):
+        assert _parse_reaction_emojis({"in_progress": ":hourglass:"})["in_progress"] == (
+            "hourglass"
+        )
+
+    def test_positional_csv(self):
+        assert _parse_reaction_emojis("hourglass,tada,boom") == {
+            "in_progress": "hourglass",
+            "done": "tada",
+            "failed": "boom",
+        }
+
+    def test_json_string(self):
+        assert _parse_reaction_emojis('{"done": "tada"}')["done"] == "tada"
+
+
+class TestReactionEmojiConfigSources:
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTION_EMOJIS", raising=False)
+        adapter, _ = _make_adapter()
+        assert adapter._slack_reaction_emojis()["in_progress"] == "eyes"
+
+    def test_extra_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        adapter, _ = _make_adapter()
+        adapter.config.extra["reaction_emojis"] = {"in_progress": "spinner"}
+        assert adapter._slack_reaction_emojis()["in_progress"] == "spinner"
+
+    def test_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        adapter, _ = _make_adapter()
+        assert adapter._slack_reaction_emojis() == {
+            "in_progress": "hourglass",
+            "done": "tada",
+            "failed": "boom",
+        }
+
+    def test_yaml_bridge_to_env(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "placeholder")
+        monkeypatch.delenv("SLACK_REACTION_EMOJIS")
+        _apply_yaml_config({}, {"reaction_emojis": {"done": "tada"}})
+        assert '"done": "tada"' in os.environ.get("SLACK_REACTION_EMOJIS", "")
 
 
 class TestReactionTriggerConfigSources:
@@ -682,3 +749,79 @@ class TestHandleSlackReactionRemoved:
         adapter._handle_slack_message.assert_awaited_once()
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"
+
+
+class TestReactionSummonLifecycle:
+    """The :eyes:/done reaction lifecycle should land on the ORIGINAL reacted
+    message for a summon (not the synthetic reaction event ts)."""
+
+    @pytest.mark.asyncio
+    async def test_summon_registers_lifecycle_target(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        await adapter._handle_slack_reaction_added(_reaction_event())
+        # synthetic ts (EVENT_TS) redirects to the reacted message (MSG_TS).
+        assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS
+
+    @pytest.mark.asyncio
+    async def test_summon_no_lifecycle_target_when_reactions_disabled(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        await adapter._handle_slack_reaction_added(_reaction_event())
+        assert adapter._reaction_lifecycle_target == {}
+
+    def _event(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            message_id=EVENT_TS,
+            source=SimpleNamespace(chat_id=CHANNEL_ID),
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_start_reacts_on_original_message(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._reacting_message_ids = {EVENT_TS}
+        adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
+
+        await adapter.on_processing_start(self._event())
+
+        # Reaction lands on the original message ts, not the synthetic event ts.
+        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+
+    @pytest.mark.asyncio
+    async def test_on_complete_swaps_on_original_and_clears_map(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        adapter._reacting_message_ids = {EVENT_TS}
+        adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
+
+        await adapter.on_processing_complete(self._event(), ProcessingOutcome.SUCCESS)
+
+        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "white_check_mark"
+        )
+        assert EVENT_TS not in adapter._reaction_lifecycle_target
+
+    @pytest.mark.asyncio
+    async def test_configured_emojis_used(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        adapter, _ = _make_adapter()
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        adapter._reacting_message_ids = {MSG_TS}  # normal message, no redirect
+
+        ev = self._event()
+        ev.message_id = MSG_TS
+        await adapter.on_processing_start(ev)
+        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "hourglass")
+
+        await adapter.on_processing_complete(ev, ProcessingOutcome.FAILURE)
+        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "hourglass")
+        adapter._add_reaction.assert_awaited_with(CHANNEL_ID, MSG_TS, "boom")

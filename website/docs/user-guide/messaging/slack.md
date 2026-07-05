@@ -452,6 +452,7 @@ Behavior:
 
 - **Off by default.** With no configured emojis, `reaction_added` events are acknowledged and discarded (the pre-existing behavior).
 - **Replies in the thread** of the reacted message (or starts one if the message is top-level), keeping channel noise down.
+- **Shows progress on the reacted message.** When `slack.reactions` is on (the default), the bot adds its in-progress reaction (`:eyes:` by default) to the message you reacted to and swaps it for the done/failed reaction when it finishes — the same lifecycle a DM or @mention gets. See [Customizing the reaction emojis](#customizing-the-reaction-emojis) to change them.
 - **Once per message** — the first matching reaction summons the bot; other users piling onto the same emoji on the same message do not re-summon it. A different configured emoji on the same message counts as a new summon.
 - **Ignores the bot's own reactions**, so the `:eyes:`/`:white_check_mark:` lifecycle reactions can never self-summon.
 - **Skin-tone variants match** their base emoji (`thumbsup::skin-tone-2` matches `thumbsup`).
@@ -462,6 +463,22 @@ Behavior:
 :::caution App reinstall required
 Reaction triggers need the `reactions:read` bot scope and the `reaction_added` event subscription (plus `reaction_removed` for the remove-to-stop behavior). Regenerate the manifest with `hermes slack manifest` (all included by default), update your app at [api.slack.com/apps](https://api.slack.com/apps), and **reinstall it to your workspace** for the new scope to take effect.
 :::
+
+### Customizing the reaction emojis
+
+The bot marks progress on messages it's working on — in-progress while running, then success or failure — for 1:1 DMs, @mentions, and reaction summons. This is on by default and toggled with `slack.reactions` (or `SLACK_REACTIONS=false`).
+
+The three emojis default to `:eyes:` / `:white_check_mark:` / `:x:` and are configurable (names without colons; custom workspace emoji are fine):
+
+```yaml
+slack:
+  reaction_emojis:
+    in_progress: hourglass_flowing_sand
+    done: white_check_mark
+    failed: warning
+```
+
+Any slot you omit keeps its default. An environment fallback is also accepted — either JSON (`SLACK_REACTION_EMOJIS='{"in_progress":"hourglass_flowing_sand"}'`) or positional CSV in `in_progress,done,failed` order (`SLACK_REACTION_EMOJIS=hourglass_flowing_sand,white_check_mark,warning`). No app reinstall is needed — this is a send-side change (the `reactions:write` scope is already in the manifest).
 
 ### Channel allowlist (`allowed_channels`)
 
