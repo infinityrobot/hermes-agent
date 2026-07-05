@@ -55,12 +55,12 @@ def react_tool(
     if not isinstance(result, dict):
         result = {"success": bool(result)}
     if result.get("success") and not remove:
-        # Read by the model right before it decides its final reply — the
-        # strongest place to stop the reflexive "Done." confirmation.
+        # Read by the model right before its final reply: don't narrate the
+        # reaction, but do engage normally if the message calls for it.
         result["note"] = (
-            "Reaction posted. This completes your response — end your turn now "
-            "with NO further message (no 'Done.', 'ok', acknowledgement, or "
-            "emoji). Reply only if you have new, substantive information to add."
+            "Reaction posted. Don't narrate it (no 'Reacted with :x:' / 'ok "
+            "👍'). Reply normally if the message invites a real response; "
+            "otherwise the reaction can stand on its own."
         )
     return json.dumps(result, ensure_ascii=False)
 
@@ -75,27 +75,21 @@ REACT_SCHEMA = {
     "name": "react",
     "description": (
         "React to the message you're replying to with an emoji — a natural, "
-        "human alternative to sending a text reply. Prefer this over a "
-        "low-value message when:\n"
-        "1. A simple acknowledgement is enough (e.g. someone thanks you, or "
-        "you want to signal you're following a thread without interjecting).\n"
-        "2. The answer is a simple yes/no/confirmation (👍 to agree, 🎉 to "
-        "celebrate, 🙏 to accept praise) — add a follow-up message only if "
-        "extra detail is actually warranted.\n"
-        "3. You're explicitly asked to react with something.\n\n"
+        "human touch that makes you feel present. Reach for it often: to "
+        "acknowledge, celebrate, agree, accept thanks/praise (🙏), signal "
+        "you're following a thread, or when asked to react. Aim for reactions "
+        "that are apt and characterful — clever, warm, or funny when it fits "
+        "— not just a rote 👍.\n\n"
         "Provide `emoji` as a Slack emoji name WITHOUT colons (e.g. "
         "'thumbsup', '+1', 'pray', 'tada'). By default it reacts to the most "
         "recent message in this chat — the one you're responding to — so you "
         "usually don't need `message_id`. Set `remove: true` to retract a "
         "reaction.\n\n"
-        "IMPORTANT: the reaction IS your entire response. After calling this "
-        "tool, END YOUR TURN WITH NO TEXT AT ALL — do not send any closing or "
-        "confirmation message. That means no 'Done.', 'Sure.', 'Got it.', "
-        "'ok', no 'reacted with :tada:', and not even a lone emoji. Sending "
-        "anything after the reaction defeats the purpose and reads as noise. "
-        "Send a follow-up message ONLY if it contains new, substantive "
-        "information the reaction itself cannot convey — a bare acknowledgement "
-        "never qualifies."
+        "A reaction ADDS to your reply, it doesn't replace engaging: if the "
+        "message invites a real response, still send one. The only thing to "
+        "avoid is narrating the reaction — don't follow it with 'Reacted with "
+        ":tada:' or 'ok 👍'; the emoji already shows, so let any message you "
+        "send be a genuine reply on its own."
     ),
     "parameters": {
         "type": "object",

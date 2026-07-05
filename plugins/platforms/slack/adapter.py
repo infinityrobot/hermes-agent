@@ -438,10 +438,6 @@ class SlackAdapter(BasePlatformAdapter):
     # (not just the thread root) is in the result to scan for. Bounded so a
     # huge thread does not pull an unbounded page.
     _REACTION_FETCH_THREAD_LIMIT = 200
-    # Window in which a wordless (emoji-only) reply is dropped after an agent
-    # reaction. The reaction is the response; a lone emoji echo carries no
-    # information. Generous enough to cover a long tool turn.
-    _REACTION_WORDLESS_WINDOW_S = 120.0
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
@@ -497,10 +493,6 @@ class SlackAdapter(BasePlatformAdapter):
         # Most-recent inbound (real) message ts per channel, so agent-initiated
         # reactions can default to "the message being replied to".
         self._last_inbound_ts: Dict[str, str] = {}
-        # chat_id → monotonic time of the last successful agent reaction. Used
-        # only to drop a content-free (emoji-only) reply that follows a
-        # reaction; one-shot, consumed by the next send().
-        self._recent_agent_reaction: Dict[str, float] = {}
         # Reaction-summon dedup: once per team:channel:ts:emoji, so a pile-on
         # of the same emoji (or a Socket Mode redelivery) only summons once.
         # Uses the shared TTL/bounded helper (correct oldest-first eviction);
@@ -1411,17 +1403,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
-        # Narrow backstop: if the agent just reacted, drop a content-free
-        # (emoji-only) reply — the reaction already is that. Any message with
-        # real text is sent normally.
-        if self._suppress_wordless_reply_after_reaction(chat_id, content):
-            logger.info(
-                "[Slack] Dropped emoji-only reply after agent reaction in %s: %r",
-                chat_id,
-                content[:40],
-            )
-            return SendResult(success=True, message_id=None)
-
         try:
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
@@ -2149,29 +2130,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not name:
             return {"success": False, "error": "emoji is required."}
         ok = await self._add_reaction(chat_id, ts, name)
-        if ok:
-            # Arm the one-shot wordless-reply guard for this chat.
-            self._recent_agent_reaction[chat_id] = time.monotonic()
         return {"success": ok, "channel": chat_id, "ts": ts, "emoji": name}
-
-    def _suppress_wordless_reply_after_reaction(
-        self, chat_id: str, content: str
-    ) -> bool:
-        """Return True iff ``content`` is a content-free (emoji-only) reply that
-        should be dropped because the agent just reacted in this chat.
-
-        Deliberately narrow: only a message with no letters or digits at all
-        (a lone emoji or ``:shortcode:``) is suppressed — anything carrying
-        real information is always sent. One-shot: the marker is consumed on
-        the first send() after a reaction, so it only affects the immediately
-        following reply and never a substantive follow-up or a later message.
-        """
-        ts = self._recent_agent_reaction.pop(chat_id, None)
-        if ts is None:
-            return False
-        if (time.monotonic() - ts) > self._REACTION_WORDLESS_WINDOW_S:
-            return False
-        return _is_wordless(content)
 
     async def remove_reaction(
         self,
@@ -5227,21 +5186,6 @@ def interactive_setup() -> None:
     home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
     if home_channel:
         save_env_value("SLACK_HOME_CHANNEL", home_channel.strip())
-
-
-def _is_wordless(text: str) -> bool:
-    """True if ``text`` carries no words — nothing but emoji, ``:shortcodes:``,
-    mentions, punctuation and whitespace (e.g. "👍", ":joy:", ":tada: 🎉").
-
-    Used to drop a redundant emoji-only reply right after an agent reaction.
-    Any letter or digit (in any script) makes it wordful, so a message with
-    real information is never treated as wordless.
-    """
-    if not text or not text.strip():
-        return True
-    core = re.sub(r"<@[^>]+>", "", text)          # strip mentions
-    core = re.sub(r":[a-zA-Z0-9_+\-']+:", "", core)  # strip :shortcode: emoji
-    return re.search(r"\w", core) is None          # any word char → not wordless
 
 
 def _parse_reaction_trigger_emojis(raw) -> set:

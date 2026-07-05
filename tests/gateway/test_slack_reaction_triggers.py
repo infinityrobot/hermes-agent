@@ -54,7 +54,6 @@ from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
 from plugins.platforms.slack.adapter import (  # noqa: E402
     SlackAdapter,
     _apply_yaml_config,
-    _is_wordless,
     _parse_reaction_status_emojis,
     _parse_reaction_trigger_emojis,
 )
@@ -92,7 +91,6 @@ def _make_adapter(reaction_trigger_emojis=None, agent_reactions=None):
     adapter._reaction_lifecycle_target = {}
     adapter._reacting_message_ids = set()
     adapter._last_inbound_ts = {}
-    adapter._recent_agent_reaction = {}
     adapter._active_sessions = {}
     adapter._session_store = None
 
@@ -893,45 +891,3 @@ class TestAgentReactions:
         assert result["success"] is True
         # Only the bot's own reaction (eyes) is removed, not someone else's tada.
         adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
-
-
-class TestWordless:
-    def test_wordless_true(self):
-        for t in ["👍", ":joy:", ":tada: 🎉", "❗️", "", "   ", "<@U123> :joy:"]:
-            assert _is_wordless(t), t
-
-    def test_wordless_false(self):
-        for t in ["Done.", "ok", "9:30am", "Here's the link", "reacted with :bike:",
-                  "はい"]:
-            assert not _is_wordless(t), t
-
-
-class TestWordlessReplySuppression:
-    @pytest.mark.asyncio
-    async def test_emoji_only_reply_suppressed_after_reaction(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "joy", message_id=MSG_TS)
-        assert adapter._suppress_wordless_reply_after_reaction(CHANNEL_ID, ":joy:")
-
-    @pytest.mark.asyncio
-    async def test_substantive_reply_not_suppressed(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "joy", message_id=MSG_TS)
-        assert not adapter._suppress_wordless_reply_after_reaction(
-            CHANNEL_ID, "Standup is 9:30am."
-        )
-
-    @pytest.mark.asyncio
-    async def test_one_shot(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        adapter._add_reaction = AsyncMock(return_value=True)
-        await adapter.add_reaction(CHANNEL_ID, "joy", message_id=MSG_TS)
-        assert adapter._suppress_wordless_reply_after_reaction(CHANNEL_ID, "👍")
-        # Marker consumed — a later emoji-only message is not suppressed.
-        assert not adapter._suppress_wordless_reply_after_reaction(CHANNEL_ID, "👍")
-
-    def test_no_reaction_means_no_suppression(self):
-        adapter, _ = _make_adapter(agent_reactions=True)
-        assert not adapter._suppress_wordless_reply_after_reaction(CHANNEL_ID, "👍")

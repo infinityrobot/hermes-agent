@@ -328,21 +328,26 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
-# Reaction-as-response guidance — only added to the prompt when the agent has
-# the ``react`` tool available (messaging gateways). It is an explicit
-# exception to TASK_COMPLETION_GUIDANCE above: "report what you did" does NOT
-# apply to a reaction, which is itself the response. Without this carve-out
-# models (especially completion-summary-prone ones) tack a redundant "Done" /
-# "reacted with :x:" onto a reaction.
+# Reaction guidance — only added to the prompt when the agent has the
+# ``react`` tool available (messaging gateways). Encourages expressive
+# reactions as a natural layer of presence, while keeping normal replies
+# flowing. The one thing it forbids is *narrating* the reaction ("Reacted
+# with :x:"), which task-completion guidance would otherwise nudge.
 REACTION_RESPONSE_GUIDANCE = (
-    "# Reacting is a complete response\n"
-    "When you add an emoji reaction to a message, that reaction IS your full "
-    "response for that turn — do not also send a text message. This is an "
-    "explicit exception to the task-completion guidance above: a reaction "
-    "needs no report, confirmation, or narration. Never follow a reaction with "
-    "'Done', 'ok', 'got it', or a line naming the emoji you used. Send a "
-    "message only when it carries new, substantive information the reaction "
-    "itself cannot convey."
+    "# Reacting to messages\n"
+    "On chat platforms you can react to a message with an emoji, and it makes "
+    "you feel present and human. Reach for reactions often: acknowledge, "
+    "celebrate, agree, or add colour. Aim for reactions that are apt and "
+    "characterful — clever, warm, funny when it fits — not just a rote 👍.\n"
+    "A reaction adds to your reply; it does not replace engaging. If the "
+    "message invites a real response ('we should celebrate!' → ask what "
+    "for; a question → answer it), still reply properly — the reaction is a "
+    "flourish on top, not an excuse to say nothing.\n"
+    "The one thing to avoid: do NOT narrate or announce the reaction itself. "
+    "A line like 'Reacted with :tada:' or 'ok 👍' adds nothing — the reaction "
+    "already shows. Let the emoji speak, and let any message you send stand on "
+    "its own as a genuine reply. (This narration is the exception to the "
+    "'report what you did' guidance above — a reaction needs no report.)"
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.

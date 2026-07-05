@@ -486,13 +486,13 @@ slack:
 This is **independent of `reactions`** above. `reactions` governs the *automatic* in-progress/done status markers; `agent_reactions` governs *deliberate* reactions the model sends as communication. You can run with `reactions: false` (no status noise) and `agent_reactions: true` (the assistant can still react on purpose), or any other combination.
 
 How it behaves:
-- The assistant reacts to the message it's replying to; when a reaction says everything, that reaction is the whole response and **no text message is sent**.
+- The assistant reacts to the message it's replying to, as an expressive layer *on top of* its normal reply — it still answers/engages when the message calls for it; the reaction doesn't replace the response.
 - It only reacts in conversations it's actually engaged in (a 1:1 DM, or a channel thread where it's been mentioned / is active) — it can't react to messages it wouldn't otherwise see.
-- Reactions from the assistant are subject to the normal `reactions:write` scope (already in the generated manifest).
-- Whether the assistant *reaches for* a reaction over a reply is guided by its prompt/persona — the config only grants the capability. See the note below.
+- Reactions are subject to the normal `reactions:write` scope (already in the generated manifest).
+- How eagerly and how *characterfully* it reacts is shaped by its prompt/persona — the config only grants the capability. See the note below.
 
-:::note Steering when it reacts
-Turning `agent_reactions: true` on gives the assistant the *ability* to react; how eagerly it prefers a reaction over a text reply is shaped by guidance in the agent's system prompt and persona. Hermes injects a built-in "a reaction is a complete response" instruction whenever the reaction capability is available, which also stops the assistant from tacking a redundant "Done."/"reacted with 🎉" message onto a reaction. Per-assistant tone can be tuned further in that assistant's persona.
+:::note Steering how it reacts
+Turning `agent_reactions: true` on gives the assistant the *ability* to react; how it uses that is guided by its system prompt and persona. Hermes injects a built-in reaction-guidance block whenever the capability is available — it encourages apt, characterful reactions and stops the assistant from *narrating* a reaction ("Reacted with 🎉"), while leaving normal replies to flow. Per-assistant tone (how playful, when to react) can be tuned further in that assistant's persona.
 :::
 
 ### Channel allowlist (`allowed_channels`)
