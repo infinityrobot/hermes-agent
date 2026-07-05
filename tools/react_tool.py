@@ -86,10 +86,12 @@ REACT_SCHEMA = {
         "usually don't need `message_id`. Set `remove: true` to retract a "
         "reaction.\n\n"
         "A reaction ADDS to your reply, it doesn't replace engaging: if the "
-        "message invites a real response, still send one. The only thing to "
-        "avoid is narrating the reaction — don't follow it with 'Reacted with "
-        ":tada:' or 'ok 👍'; the emoji already shows, so let any message you "
-        "send be a genuine reply on its own."
+        "message invites a real response, still send one. Reactions express "
+        "sentiment, not work status — never react with 👀/⏳/✅ to signal "
+        "you're looking, working, or done (those are separate progress "
+        "markers); when asked a question, just answer it. And don't narrate "
+        "the reaction — no 'Reacted with :tada:' / 'ok 👍'; the emoji already "
+        "shows, so let any message you send be a genuine reply on its own."
     ),
     "parameters": {
         "type": "object",
