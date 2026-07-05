@@ -61,10 +61,10 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Agent-initiated emoji reactions (react to the current message instead of
-    # replying). Only functional on the gateway (react_callback) and when the
-    # adapter opts in (e.g. slack.agent_reactions); inert elsewhere.
-    "react",
+    # NOTE: the `react` tool is intentionally NOT in core. It only works on
+    # adapters exposing the agent-facing add_reaction contract (currently
+    # Slack) and gated on that platform's opt-in; the gateway adds the
+    # `react` toolset per-session where supported (see gateway/run.py).
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management

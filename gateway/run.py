@@ -16784,6 +16784,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        # The `react` tool is exposed only where it actually works and is
+        # opted in — currently Slack with slack.agent_reactions on. Other
+        # adapters lack the agent-facing add_reaction contract, so we don't
+        # pay its schema/prompt cost or invite unsupported calls there.
+        # Extend this gate when another platform gains the capability.
+        try:
+            _react_adapter = self.adapters.get(source.platform)
+            if (
+                platform_key == "slack"
+                and _react_adapter is not None
+                and getattr(_react_adapter, "_agent_reactions_enabled", lambda: False)()
+                and "react" not in enabled_toolsets
+            ):
+                enabled_toolsets = sorted(set(enabled_toolsets) | {"react"})
+        except Exception:
+            logger.debug("react toolset gating check failed", exc_info=True)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
