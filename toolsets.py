@@ -61,10 +61,7 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # NOTE: the `react` tool is intentionally NOT in core. It only works on
-    # adapters exposing the agent-facing add_reaction contract (currently
-    # Slack) and gated on that platform's opt-in; the gateway adds the
-    # `react` toolset per-session where supported (see gateway/run.py).
+    # (react is intentionally not here — gated per-platform in gateway/run.py)
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
