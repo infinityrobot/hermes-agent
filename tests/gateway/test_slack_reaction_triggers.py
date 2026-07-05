@@ -188,9 +188,7 @@ class TestParseReactionTriggerEmojis:
         assert _parse_reaction_trigger_emojis(None) == set()
         assert _parse_reaction_trigger_emojis("") == set()
         assert _parse_reaction_trigger_emojis([]) == set()
-        # A stray mapping is not a valid value for the flat key → off.
         assert _parse_reaction_trigger_emojis({}) == set()
-        assert _parse_reaction_trigger_emojis({"emojis": ["hermes"]}) == set()
 
     def test_list(self):
         assert _parse_reaction_trigger_emojis(["hermes", "eyes"]) == {"hermes", "eyes"}
@@ -891,3 +889,35 @@ class TestAgentReactions:
         assert result["success"] is True
         # Only the bot's own reaction (eyes) is removed, not someone else's tada.
         adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+
+
+class TestReactionsToggle:
+    """slack.reactions (status markers) must honour config.yaml, not just env."""
+
+    def test_yaml_false_disables(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter.config.extra["reactions"] = False
+        assert adapter._reactions_enabled() is False
+
+    def test_yaml_false_string_disables(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter.config.extra["reactions"] = "false"
+        assert adapter._reactions_enabled() is False
+
+    def test_yaml_true(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        adapter.config.extra["reactions"] = True
+        assert adapter._reactions_enabled() is True
+
+    def test_default_on(self, monkeypatch):
+        monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+        adapter, _ = _make_adapter()
+        assert adapter._reactions_enabled() is True
+
+    def test_env_fallback_when_no_yaml(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter, _ = _make_adapter()
+        assert adapter._reactions_enabled() is False

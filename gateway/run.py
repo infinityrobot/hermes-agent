@@ -18277,7 +18277,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "error": "This platform does not support reactions.",
                     }
                 if remove:
-                    coro = fn(chat_id=_status_chat_id, message_id=message_id)
+                    # Forward the emoji so the model can retract a specific
+                    # reaction; adapters treat emoji=None as "remove my own".
+                    coro = fn(
+                        chat_id=_status_chat_id,
+                        message_id=message_id,
+                        emoji=(emoji or None),
+                    )
                 else:
                     coro = fn(
                         chat_id=_status_chat_id, emoji=emoji, message_id=message_id

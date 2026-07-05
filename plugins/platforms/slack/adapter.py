@@ -2178,8 +2178,23 @@ class SlackAdapter(BasePlatformAdapter):
         return {"success": removed > 0, "channel": chat_id, "ts": ts, "removed": removed}
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        """Whether the automatic in-progress/done status markers are enabled.
+
+        Reads ``slack.reactions`` from config first (so ``reactions: false`` in
+        config.yaml actually disables them), falling back to the
+        ``SLACK_REACTIONS`` env var. Default on.
+        """
+        configured = self.config.extra.get("reactions") if self.config.extra else None
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("SLACK_REACTIONS", "true").lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
+        }
 
     def _slack_reaction_status_emojis(self) -> dict:
         """Return the lifecycle emoji names: {in_progress, done, failed}.
