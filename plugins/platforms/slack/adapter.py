@@ -2084,22 +2084,22 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    def _slack_reaction_emojis(self) -> dict:
+    def _slack_reaction_status_emojis(self) -> dict:
         """Return the lifecycle emoji names: {in_progress, done, failed}.
 
-        Configurable via ``slack.reaction_emojis`` (a mapping, JSON, or a
-        positional CSV) or ``SLACK_REACTION_EMOJIS``, merged over the defaults
+        Configurable via ``slack.reaction_status_emojis`` (a mapping, JSON, or a
+        positional CSV) or ``SLACK_REACTION_STATUS_EMOJIS``, merged over the defaults
         ``eyes`` / ``white_check_mark`` / ``x``. Cached — read on every
         processed message.
         """
-        cached = getattr(self, "_reaction_emojis_cache", None)
+        cached = getattr(self, "_reaction_status_emojis_cache", None)
         if cached is not None:
             return cached
-        raw = self.config.extra.get("reaction_emojis") if self.config.extra else None
+        raw = self.config.extra.get("reaction_status_emojis") if self.config.extra else None
         if raw is None:
-            raw = os.getenv("SLACK_REACTION_EMOJIS", "")
-        emojis = _parse_reaction_emojis(raw)
-        self._reaction_emojis_cache = emojis
+            raw = os.getenv("SLACK_REACTION_STATUS_EMOJIS", "")
+        emojis = _parse_reaction_status_emojis(raw)
+        self._reaction_status_emojis_cache = emojis
         return emojis
 
     # ----- Reaction triggers (emoji summon) -----
@@ -2661,7 +2661,7 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(
                 channel_id,
                 self._reaction_lifecycle_ts(ts),
-                self._slack_reaction_emojis()["in_progress"],
+                self._slack_reaction_status_emojis()["in_progress"],
             )
 
     async def on_processing_complete(
@@ -2679,7 +2679,7 @@ class SlackAdapter(BasePlatformAdapter):
         getattr(self, "_reaction_lifecycle_target", {}).pop(ts, None)
         if not channel_id:
             return
-        emojis = self._slack_reaction_emojis()
+        emojis = self._slack_reaction_status_emojis()
         await self._remove_reaction(channel_id, react_ts, emojis["in_progress"])
         if outcome == ProcessingOutcome.SUCCESS:
             await self._add_reaction(channel_id, react_ts, emojis["done"])
@@ -5105,15 +5105,15 @@ def _parse_reaction_trigger_emojis(raw) -> set:
     return emojis
 
 
-_DEFAULT_REACTION_EMOJIS = {
+_DEFAULT_REACTION_STATUS_EMOJIS = {
     "in_progress": "eyes",
     "done": "white_check_mark",
     "failed": "x",
 }
 
 
-def _parse_reaction_emojis(raw) -> dict:
-    """Normalise a ``reaction_emojis`` config value into a full emoji mapping.
+def _parse_reaction_status_emojis(raw) -> dict:
+    """Normalise a ``reaction_status_emojis`` config value into a full emoji mapping.
 
     Returns ``{in_progress, done, failed}`` merged over the defaults
     (``eyes`` / ``white_check_mark`` / ``x``), so a partial override only
@@ -5121,7 +5121,7 @@ def _parse_reaction_emojis(raw) -> dict:
     positional CSV (``in_progress,done,failed``). Surrounding colons are
     stripped so ``:eyes:`` and ``eyes`` are equivalent.
     """
-    result = dict(_DEFAULT_REACTION_EMOJIS)
+    result = dict(_DEFAULT_REACTION_STATUS_EMOJIS)
     if raw is None:
         return result
     if isinstance(raw, str):
@@ -5187,9 +5187,9 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         rt_emojis = _parse_reaction_trigger_emojis(rt)
         if rt_emojis:
             os.environ["SLACK_REACTION_TRIGGER_EMOJIS"] = ",".join(sorted(rt_emojis))
-    re_cfg = slack_cfg.get("reaction_emojis")
-    if re_cfg is not None and not os.getenv("SLACK_REACTION_EMOJIS"):
-        os.environ["SLACK_REACTION_EMOJIS"] = json.dumps(_parse_reaction_emojis(re_cfg))
+    re_cfg = slack_cfg.get("reaction_status_emojis")
+    if re_cfg is not None and not os.getenv("SLACK_REACTION_STATUS_EMOJIS"):
+        os.environ["SLACK_REACTION_STATUS_EMOJIS"] = json.dumps(_parse_reaction_status_emojis(re_cfg))
     ac = slack_cfg.get("allowed_channels")
     if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
         if isinstance(ac, list):
@@ -5232,7 +5232,7 @@ def register(ctx) -> None:
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
         # free_response_channels, reactions, reaction_trigger_emojis,
-        # reaction_emojis, allowed_channels) into SLACK_*
+        # reaction_status_emojis, allowed_channels) into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,

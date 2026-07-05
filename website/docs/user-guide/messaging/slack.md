@@ -466,13 +466,13 @@ The three emojis default to `:eyes:` / `:white_check_mark:` / `:x:` and are conf
 
 ```yaml
 slack:
-  reaction_emojis:
+  reaction_status_emojis:
     in_progress: hourglass_flowing_sand
     done: white_check_mark
     failed: warning
 ```
 
-Any slot you omit keeps its default. An environment fallback is also accepted — either JSON (`SLACK_REACTION_EMOJIS='{"in_progress":"hourglass_flowing_sand"}'`) or positional CSV in `in_progress,done,failed` order (`SLACK_REACTION_EMOJIS=hourglass_flowing_sand,white_check_mark,warning`). No app reinstall is needed — this is a send-side change (the `reactions:write` scope is already in the manifest).
+Any slot you omit keeps its default. An environment fallback is also accepted — either JSON (`SLACK_REACTION_STATUS_EMOJIS='{"in_progress":"hourglass_flowing_sand"}'`) or positional CSV in `in_progress,done,failed` order (`SLACK_REACTION_STATUS_EMOJIS=hourglass_flowing_sand,white_check_mark,warning`). No app reinstall is needed — this is a send-side change (the `reactions:write` scope is already in the manifest).
 
 ### Channel allowlist (`allowed_channels`)
 

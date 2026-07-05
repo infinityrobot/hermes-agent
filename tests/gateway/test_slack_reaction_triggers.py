@@ -54,7 +54,7 @@ from gateway.platforms.helpers import MessageDeduplicator  # noqa: E402
 from plugins.platforms.slack.adapter import (  # noqa: E402
     SlackAdapter,
     _apply_yaml_config,
-    _parse_reaction_emojis,
+    _parse_reaction_status_emojis,
     _parse_reaction_trigger_emojis,
 )
 
@@ -205,67 +205,67 @@ class TestParseReactionTriggerEmojis:
         assert _parse_reaction_trigger_emojis(42) == set()
 
 
-class TestParseReactionEmojis:
+class TestParseReactionStatusEmojis:
     DEFAULTS = {"in_progress": "eyes", "done": "white_check_mark", "failed": "x"}
 
     def test_none_and_empty_return_defaults(self):
-        assert _parse_reaction_emojis(None) == self.DEFAULTS
-        assert _parse_reaction_emojis("") == self.DEFAULTS
-        assert _parse_reaction_emojis({}) == self.DEFAULTS
+        assert _parse_reaction_status_emojis(None) == self.DEFAULTS
+        assert _parse_reaction_status_emojis("") == self.DEFAULTS
+        assert _parse_reaction_status_emojis({}) == self.DEFAULTS
 
     def test_full_mapping(self):
         raw = {"in_progress": "hourglass", "done": "tada", "failed": "boom"}
-        assert _parse_reaction_emojis(raw) == raw
+        assert _parse_reaction_status_emojis(raw) == raw
 
     def test_partial_mapping_merges_over_defaults(self):
-        assert _parse_reaction_emojis({"done": "tada"}) == {
+        assert _parse_reaction_status_emojis({"done": "tada"}) == {
             "in_progress": "eyes",
             "done": "tada",
             "failed": "x",
         }
 
     def test_colons_stripped(self):
-        assert _parse_reaction_emojis({"in_progress": ":hourglass:"})["in_progress"] == (
+        assert _parse_reaction_status_emojis({"in_progress": ":hourglass:"})["in_progress"] == (
             "hourglass"
         )
 
     def test_positional_csv(self):
-        assert _parse_reaction_emojis("hourglass,tada,boom") == {
+        assert _parse_reaction_status_emojis("hourglass,tada,boom") == {
             "in_progress": "hourglass",
             "done": "tada",
             "failed": "boom",
         }
 
     def test_json_string(self):
-        assert _parse_reaction_emojis('{"done": "tada"}')["done"] == "tada"
+        assert _parse_reaction_status_emojis('{"done": "tada"}')["done"] == "tada"
 
 
-class TestReactionEmojiConfigSources:
+class TestReactionStatusEmojiConfigSources:
     def test_default(self, monkeypatch):
-        monkeypatch.delenv("SLACK_REACTION_EMOJIS", raising=False)
+        monkeypatch.delenv("SLACK_REACTION_STATUS_EMOJIS", raising=False)
         adapter, _ = _make_adapter()
-        assert adapter._slack_reaction_emojis()["in_progress"] == "eyes"
+        assert adapter._slack_reaction_status_emojis()["in_progress"] == "eyes"
 
     def test_extra_takes_precedence(self, monkeypatch):
-        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        monkeypatch.setenv("SLACK_REACTION_STATUS_EMOJIS", "hourglass,tada,boom")
         adapter, _ = _make_adapter()
-        adapter.config.extra["reaction_emojis"] = {"in_progress": "spinner"}
-        assert adapter._slack_reaction_emojis()["in_progress"] == "spinner"
+        adapter.config.extra["reaction_status_emojis"] = {"in_progress": "spinner"}
+        assert adapter._slack_reaction_status_emojis()["in_progress"] == "spinner"
 
     def test_env_fallback(self, monkeypatch):
-        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        monkeypatch.setenv("SLACK_REACTION_STATUS_EMOJIS", "hourglass,tada,boom")
         adapter, _ = _make_adapter()
-        assert adapter._slack_reaction_emojis() == {
+        assert adapter._slack_reaction_status_emojis() == {
             "in_progress": "hourglass",
             "done": "tada",
             "failed": "boom",
         }
 
     def test_yaml_bridge_to_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "placeholder")
-        monkeypatch.delenv("SLACK_REACTION_EMOJIS")
-        _apply_yaml_config({}, {"reaction_emojis": {"done": "tada"}})
-        assert '"done": "tada"' in os.environ.get("SLACK_REACTION_EMOJIS", "")
+        monkeypatch.setenv("SLACK_REACTION_STATUS_EMOJIS", "placeholder")
+        monkeypatch.delenv("SLACK_REACTION_STATUS_EMOJIS")
+        _apply_yaml_config({}, {"reaction_status_emojis": {"done": "tada"}})
+        assert '"done": "tada"' in os.environ.get("SLACK_REACTION_STATUS_EMOJIS", "")
 
 
 class TestReactionTriggerConfigSources:
@@ -798,7 +798,7 @@ class TestReactionSummonLifecycle:
     @pytest.mark.asyncio
     async def test_configured_emojis_used(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        monkeypatch.setenv("SLACK_REACTION_EMOJIS", "hourglass,tada,boom")
+        monkeypatch.setenv("SLACK_REACTION_STATUS_EMOJIS", "hourglass,tada,boom")
         adapter, _ = _make_adapter()
         adapter._add_reaction = AsyncMock(return_value=True)
         adapter._remove_reaction = AsyncMock(return_value=True)
