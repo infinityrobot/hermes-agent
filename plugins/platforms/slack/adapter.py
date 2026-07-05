@@ -1150,7 +1150,7 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_file_change(event, say):
                 pass
 
-            # Reactions: when ``slack.reaction_triggers`` is configured, a
+            # Reactions: when ``slack.reaction_trigger_emojis`` is configured, a
             # matching emoji reaction "summons" the bot onto the reacted
             # message (threaded reply). Otherwise the handler falls through
             # to a plain ack so high-traffic channels do not fill
@@ -2109,7 +2109,7 @@ class SlackAdapter(BasePlatformAdapter):
         as reactions.
 
         Opt-in: the default is an empty set, which keeps ``reaction_added``
-        a plain ack. Reads ``slack.reaction_triggers`` from config.yaml
+        a plain ack. Reads ``slack.reaction_trigger_emojis`` from config.yaml
         (a bare list, an ``{emojis: [...]}`` mapping, or a CSV string),
         falling back to the ``SLACK_REACTION_TRIGGER_EMOJIS`` env var. The
         parsed set is cached — this runs on every reaction event and the
@@ -2118,7 +2118,11 @@ class SlackAdapter(BasePlatformAdapter):
         cached = getattr(self, "_reaction_trigger_emojis_cache", None)
         if cached is not None:
             return cached
-        raw = self.config.extra.get("reaction_triggers") if self.config.extra else None
+        raw = (
+            self.config.extra.get("reaction_trigger_emojis")
+            if self.config.extra
+            else None
+        )
         if raw is None:
             raw = os.getenv("SLACK_REACTION_TRIGGER_EMOJIS", "")
         emojis = _parse_reaction_trigger_emojis(raw)
@@ -2239,7 +2243,7 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> None:
         """Route an opt-in emoji reaction into the normal message pipeline.
 
-        When ``slack.reaction_triggers`` is configured, reacting to a message
+        When ``slack.reaction_trigger_emojis`` is configured, reacting to a message
         with one of the listed emojis summons the bot on that message: the
         reacted message is fetched and replayed through
         ``_handle_slack_message`` as if the reactor had @mentioned the bot,
@@ -2365,7 +2369,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Treat removing a summon emoji from an active thread as ``/stop``.
 
         Symmetric with the summon path: only a configured
-        ``slack.reaction_triggers`` emoji is a control signal (so unreacting a
+        ``slack.reaction_trigger_emojis`` emoji is a control signal (so unreacting a
         casual :thumbsup: never cancels a turn), and it is additionally gated
         by the Slack reactions toggle (``slack.reactions`` / ``SLACK_REACTIONS``).
         It only fires when the reacted message maps to a currently active
@@ -5079,18 +5083,16 @@ def interactive_setup() -> None:
 
 
 def _parse_reaction_trigger_emojis(raw) -> set:
-    """Normalise a ``reaction_triggers`` config value into a set of emoji names.
+    """Normalise a ``reaction_trigger_emojis`` config value into a name set.
 
-    Accepts a bare list of names, a mapping with an ``emojis`` key, or a CSV
-    string (the env-var form). Emoji names are lowercased with surrounding
-    colons stripped, so ``:hermes:`` and ``hermes`` are equivalent. Presence
-    of any emoji is what enables the feature — an empty/absent value keeps it
-    off (consistent with free_response_channels / allowed_channels).
+    Accepts a list of names or a CSV string (the env-var form). Emoji names
+    are lowercased with surrounding colons stripped, so ``:hermes:`` and
+    ``hermes`` are equivalent. Presence of any emoji is what enables the
+    feature — an empty/absent value keeps it off (consistent with
+    free_response_channels / allowed_channels).
     """
     if raw is None:
         return set()
-    if isinstance(raw, dict):
-        raw = raw.get("emojis")
     if isinstance(raw, str):
         raw = raw.split(",")
     if not isinstance(raw, (list, tuple, set)):
@@ -5180,7 +5182,7 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
-    rt = slack_cfg.get("reaction_triggers")
+    rt = slack_cfg.get("reaction_trigger_emojis")
     if rt is not None and not os.getenv("SLACK_REACTION_TRIGGER_EMOJIS"):
         rt_emojis = _parse_reaction_trigger_emojis(rt)
         if rt_emojis:
@@ -5229,7 +5231,7 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, reaction_triggers,
+        # free_response_channels, reactions, reaction_trigger_emojis,
         # reaction_emojis, allowed_channels) into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.

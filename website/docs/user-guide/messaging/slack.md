@@ -429,23 +429,16 @@ Opt-in: summon the bot onto any message by reacting to it with a configured emoj
 
 ```yaml
 slack:
-  reaction_triggers:
-    emojis:
-      - hermes           # emoji names without colons
-      - eyes
+  reaction_trigger_emojis:      # emoji names without colons
+    - hermes
+    - eyes
 ```
 
-Listing at least one emoji is what turns the feature on — there's no separate `enabled` flag (an empty or absent list leaves it off, like `free_response_channels` and `allowed_channels`).
+Listing at least one emoji is what turns the feature on — there's no separate `enabled` flag (an empty or absent list leaves it off, like `free_response_channels` and `allowed_channels`). An inline list (`reaction_trigger_emojis: [hermes, eyes]`) works too.
 
-Shorthand and environment-variable forms are also accepted:
-
-```yaml
-slack:
-  reaction_triggers: [hermes, eyes]
-```
+Environment-variable fallback (config.yaml takes precedence):
 
 ```bash
-# Fallback only — config.yaml takes precedence
 SLACK_REACTION_TRIGGER_EMOJIS=hermes,eyes
 ```
 

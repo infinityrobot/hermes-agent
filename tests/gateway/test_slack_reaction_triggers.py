@@ -1,5 +1,5 @@
 """
-Tests for Slack reaction triggers (slack.reaction_triggers / emoji summon).
+Tests for Slack reaction triggers (slack.reaction_trigger_emojis / emoji summon).
 
 Reacting to a message with a configured emoji summons the bot on that
 message: the reacted message is fetched and replayed through
@@ -71,10 +71,10 @@ MSG_TS = "1751600000.000100"
 EVENT_TS = "1751600100.000200"
 
 
-def _make_adapter(reaction_triggers=None):
+def _make_adapter(reaction_trigger_emojis=None):
     extra = {}
-    if reaction_triggers is not None:
-        extra["reaction_triggers"] = reaction_triggers
+    if reaction_trigger_emojis is not None:
+        extra["reaction_trigger_emojis"] = reaction_trigger_emojis
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -185,19 +185,12 @@ class TestParseReactionTriggerEmojis:
         assert _parse_reaction_trigger_emojis(None) == set()
         assert _parse_reaction_trigger_emojis("") == set()
         assert _parse_reaction_trigger_emojis([]) == set()
+        # A stray mapping is not a valid value for the flat key → off.
         assert _parse_reaction_trigger_emojis({}) == set()
+        assert _parse_reaction_trigger_emojis({"emojis": ["hermes"]}) == set()
 
-    def test_mapping_form(self):
-        assert _parse_reaction_trigger_emojis({"emojis": ["hermes", "eyes"]}) == {
-            "hermes",
-            "eyes",
-        }
-
-    def test_enabled_key_is_ignored(self):
-        # `enabled` was dropped — presence of emojis is the on/off signal, so a
-        # leftover `enabled: false` no longer disables the feature.
-        raw = {"enabled": False, "emojis": ["hermes"]}
-        assert _parse_reaction_trigger_emojis(raw) == {"hermes"}
+    def test_list(self):
+        assert _parse_reaction_trigger_emojis(["hermes", "eyes"]) == {"hermes", "eyes"}
 
     def test_bare_list(self):
         assert _parse_reaction_trigger_emojis(["hermes"]) == {"hermes"}
@@ -278,7 +271,7 @@ class TestReactionEmojiConfigSources:
 class TestReactionTriggerConfigSources:
     def test_extra_takes_precedence(self, monkeypatch):
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "eyes")
-        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         assert adapter._slack_reaction_trigger_emojis() == {"hermes"}
 
     def test_env_fallback(self, monkeypatch):
@@ -293,27 +286,25 @@ class TestReactionTriggerConfigSources:
 
 
 class TestApplyYamlConfigBridge:
-    def test_bridges_mapping_to_env(self, monkeypatch):
+    def test_bridges_list_to_env(self, monkeypatch):
         # setenv-then-delenv records the var's original state with
         # monkeypatch, so the value _apply_yaml_config writes straight into
         # os.environ is rolled back at teardown.
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "placeholder")
         monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS")
-        _apply_yaml_config(
-            {}, {"reaction_triggers": {"emojis": ["hermes", "eyes"]}}
-        )
+        _apply_yaml_config({}, {"reaction_trigger_emojis": ["hermes", "eyes"]})
         assert os.environ.get("SLACK_REACTION_TRIGGER_EMOJIS") == "eyes,hermes"
 
-    def test_empty_emojis_not_bridged(self, monkeypatch):
+    def test_empty_list_not_bridged(self, monkeypatch):
         # No emojis → nothing to bridge (the feature stays off).
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "placeholder")
         monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS")
-        _apply_yaml_config({}, {"reaction_triggers": {"emojis": []}})
+        _apply_yaml_config({}, {"reaction_trigger_emojis": []})
         assert os.environ.get("SLACK_REACTION_TRIGGER_EMOJIS") is None
 
     def test_env_wins_over_yaml(self, monkeypatch):
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "eyes")
-        _apply_yaml_config({}, {"reaction_triggers": ["hermes"]})
+        _apply_yaml_config({}, {"reaction_trigger_emojis": ["hermes"]})
         assert os.environ.get("SLACK_REACTION_TRIGGER_EMOJIS") == "eyes"
 
 
@@ -332,7 +323,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_matching_emoji_summons_in_thread(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
 
         adapter._handle_slack_message.assert_awaited_once()
@@ -351,14 +342,14 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_non_matching_emoji_ignored(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event(reaction="tada"))
         client.conversations_replies.assert_not_awaited()
         adapter._handle_slack_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skin_tone_variant_matches(self):
-        adapter, _ = _make_adapter(reaction_triggers=["thumbsup"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["thumbsup"])
         await adapter._handle_slack_reaction_added(
             _reaction_event(reaction="thumbsup::skin-tone-2")
         )
@@ -366,14 +357,14 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_bots_own_reaction_ignored(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event(user=BOT_USER_ID))
         client.conversations_replies.assert_not_awaited()
         adapter._handle_slack_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_team_bot_user_reaction_ignored(self):
-        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         adapter._team_bot_user_ids = {"T1": "U_OTHER_WS_BOT"}
         await adapter._handle_slack_reaction_added(
             _reaction_event(user="U_OTHER_WS_BOT")
@@ -382,7 +373,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_duplicate_reaction_summons_once(self):
-        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
         # Second user reacting with the same emoji on the same message.
         await adapter._handle_slack_reaction_added(
@@ -392,7 +383,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_different_messages_each_summon(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         # Echo the requested ts so both fetches resolve their own message.
         client.conversations_replies.side_effect = lambda **kw: {
             "ok": True,
@@ -406,14 +397,14 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_non_message_item_ignored(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event(item_type="file"))
         client.conversations_replies.assert_not_awaited()
         adapter._handle_slack_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_threaded_message_summons_in_parent_thread(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         parent_ts = "1751500000.000001"
         client.conversations_replies.return_value = {
             "ok": True,
@@ -432,7 +423,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_access_denied_posts_notice(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         client.conversations_replies.side_effect = Exception("not_in_channel")
         client.conversations_history.side_effect = Exception("not_in_channel")
 
@@ -447,7 +438,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_access_notice_failure_is_swallowed(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         client.conversations_replies.side_effect = Exception("channel_not_found")
         client.conversations_history.side_effect = Exception("channel_not_found")
         client.chat_postMessage.side_effect = Exception("channel_not_found")
@@ -458,7 +449,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_history_fallback_when_replies_fails(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         client.conversations_replies.side_effect = Exception("boom")
         client.conversations_history.return_value = {
             "ok": True,
@@ -471,7 +462,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_dm_channel_type(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(
             _reaction_event(channel="D12345678")
         )
@@ -480,7 +471,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_files_passed_through(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         files = [{"id": "F123", "name": "report.pdf"}]
         client.conversations_replies.return_value = {
             "ok": True,
@@ -497,7 +488,7 @@ class TestHandleSlackReactionAdded:
         # Default allow_bots="none": a bot reactor is dropped, and must NOT
         # consume the once-per-message summon slot.
         monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         client.users_info.return_value = {"ok": True, "user": {"is_bot": True}}
         await adapter._handle_slack_reaction_added(_reaction_event(user="U_OTHER_BOT"))
         adapter._handle_slack_message.assert_not_awaited()
@@ -511,7 +502,7 @@ class TestHandleSlackReactionAdded:
     @pytest.mark.asyncio
     async def test_foreign_bot_reactor_stamped_when_bots_allowed(self, monkeypatch):
         monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         adapter.config.extra["allow_bots"] = "all"
         client.users_info.return_value = {"ok": True, "user": {"is_bot": True}}
 
@@ -526,7 +517,7 @@ class TestHandleSlackReactionAdded:
     @pytest.mark.asyncio
     async def test_team_id_recovered_from_outer_body(self):
         # The inner reaction event has no team; the outer Bolt body carries it.
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(
             _reaction_event(), body={"team_id": "T_OUTER"}
         )
@@ -536,7 +527,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_failed_fetch_can_be_retried(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         # First attempt: fetch fails on both paths → access notice, no summon.
         client.conversations_replies.side_effect = Exception("not_in_channel")
         client.conversations_history.side_effect = Exception("not_in_channel")
@@ -554,7 +545,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_mpim_channel_type_resolved(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(
             _reaction_event(channel="G12345678")
         )
@@ -565,7 +556,7 @@ class TestHandleSlackReactionAdded:
     async def test_reaction_on_in_thread_reply_resolves(self):
         # conversations.replies returns the parent FIRST; the reacted reply is
         # only in the result because we page the thread (limit > 1).
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         parent_ts = "1751500000.000001"
         client.conversations_replies.return_value = {
             "ok": True,
@@ -587,7 +578,7 @@ class TestHandleSlackReactionAdded:
 
     @pytest.mark.asyncio
     async def test_channel_type_not_cached_on_transient_failure(self):
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         client.conversations_info.side_effect = Exception("ratelimited")
 
         first = await adapter._resolve_reaction_channel_type("G12345678")
@@ -609,7 +600,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_reactions_disabled_ignores_stop_trigger(self, monkeypatch):
         monkeypatch.setenv("SLACK_REACTIONS", "false")
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
@@ -620,7 +611,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_non_trigger_emoji_removal_ignored(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
 
         await adapter._handle_slack_reaction_removed(
@@ -634,7 +625,7 @@ class TestHandleSlackReactionRemoved:
     async def test_removal_disabled_when_no_triggers(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
         monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS", raising=False)
-        adapter, client = _make_adapter()  # no reaction_triggers
+        adapter, client = _make_adapter()  # no reaction_trigger_emojis
         _mark_active_thread(adapter)
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
@@ -645,7 +636,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_active_top_level_thread_synthesizes_stop(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
         summon_key = f":{CHANNEL_ID}:{MSG_TS}:hermes"
         adapter._reaction_summon_dedup.is_duplicate(summon_key)  # record it
@@ -666,7 +657,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_inactive_thread_ignored(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         # Some other thread is in flight, but not the reacted message's — so
         # the handler fetches to check for a parent root, then still ignores it.
         _mark_active_thread(adapter, thread_ts="9999999999.000000")
@@ -680,7 +671,7 @@ class TestHandleSlackReactionRemoved:
     async def test_idle_bot_skips_lookup(self, monkeypatch):
         # No turn in flight anywhere: bail before any Slack API call.
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
 
@@ -691,7 +682,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_bots_own_reaction_removal_ignored(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
 
         await adapter._handle_slack_reaction_removed(
@@ -704,7 +695,7 @@ class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
     async def test_threaded_message_removal_stops_parent_thread(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         parent_ts = "1751500000.000001"
         _mark_active_thread(adapter, thread_ts=parent_ts)
         client.conversations_replies.return_value = {
@@ -734,7 +725,7 @@ class TestHandleSlackReactionRemoved:
         # bot_uid must fall back to the primary id, or the <@bot> prefix is
         # dropped and mention-gating rejects the synthetic /stop.
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         adapter._team_bot_user_ids = {"T1": ""}
         _mark_active_thread(adapter, thread_ts=MSG_TS)
 
@@ -754,7 +745,7 @@ class TestReactionSummonLifecycle:
     @pytest.mark.asyncio
     async def test_summon_registers_lifecycle_target(self, monkeypatch):
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
-        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
         # synthetic ts (EVENT_TS) redirects to the reacted message (MSG_TS).
         assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS
@@ -762,7 +753,7 @@ class TestReactionSummonLifecycle:
     @pytest.mark.asyncio
     async def test_summon_no_lifecycle_target_when_reactions_disabled(self, monkeypatch):
         monkeypatch.setenv("SLACK_REACTIONS", "false")
-        adapter, _ = _make_adapter(reaction_triggers=["hermes"])
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
         assert adapter._reaction_lifecycle_target == {}
 
