@@ -599,15 +599,19 @@ class TestHandleSlackReactionAdded:
 
 class TestHandleSlackReactionRemoved:
     @pytest.mark.asyncio
-    async def test_reactions_disabled_ignores_stop_trigger(self, monkeypatch):
+    async def test_status_reactions_toggle_does_not_gate_stop(self, monkeypatch):
+        # remove-to-stop is part of the summon feature — it must fire even when
+        # the status-marker toggle (slack.reactions) is off, as long as a
+        # summon emoji is configured and the thread is active.
         monkeypatch.setenv("SLACK_REACTIONS", "false")
         adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
 
-        client.conversations_replies.assert_not_awaited()
-        adapter._handle_slack_message.assert_not_awaited()
+        adapter._handle_slack_message.assert_awaited_once()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["text"] == f"<@{BOT_USER_ID}> /stop"
 
     @pytest.mark.asyncio
     async def test_non_trigger_emoji_removal_ignored(self, monkeypatch):

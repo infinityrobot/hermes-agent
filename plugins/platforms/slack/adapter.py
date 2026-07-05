@@ -2484,16 +2484,14 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> None:
         """Treat removing a summon emoji from an active thread as ``/stop``.
 
-        Symmetric with the summon path: only a configured
-        ``slack.reaction_trigger_emojis`` emoji is a control signal (so unreacting a
-        casual :thumbsup: never cancels a turn), and it is additionally gated
-        by the Slack reactions toggle (``slack.reactions`` / ``SLACK_REACTIONS``).
-        It only fires when the reacted message maps to a currently active
-        Hermes session, so ordinary reaction cleanup remains a plain ack.
+        Part of the summon feature, so it is gated purely on the summon config
+        (``slack.reaction_trigger_emojis``): only removing a configured summon
+        emoji is a control signal — unreacting a casual :thumbsup: never
+        cancels a turn. It is deliberately NOT gated by ``slack.reactions``
+        (that toggle governs the automatic status markers, a separate feature).
+        Only fires when the reacted message maps to a currently active Hermes
+        session, so ordinary reaction cleanup remains a plain ack.
         """
-        if not self._reactions_enabled():
-            return
-
         ctx = self._parse_reaction_event(event, body)
         if ctx is None or not ctx.user_id:
             return
@@ -3466,11 +3464,6 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
-        # Remember the latest real inbound message per channel so agent-initiated
-        # reactions can default to "the message being replied to". Skip synthetic
-        # reaction replays (their ts is a reaction event_ts, not a posted message).
-        if channel_id and ts and not event.get("_reaction_synthetic"):
-            self._last_inbound_ts[channel_id] = ts
         assistant_meta = self._lookup_assistant_thread_metadata(
             event,
             channel_id=channel_id,
@@ -3943,6 +3936,14 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
+
+        # Remember the message the bot is actually engaging with, so an
+        # agent-initiated reaction with no explicit message_id targets it —
+        # not some unrelated message the bot ignored. Recorded HERE (after all
+        # mention/allowed-channel gating) rather than on arrival, and skipping
+        # synthetic reaction replays (whose ts is a reaction event_ts).
+        if channel_id and ts and not event.get("_reaction_synthetic"):
+            self._last_inbound_ts[channel_id] = ts
 
         msg_event = MessageEvent(
             text=text,
