@@ -430,17 +430,46 @@ class TestHandleSlackReactionAdded:
         assert synthetic["files"] == files
 
     @pytest.mark.asyncio
-    async def test_foreign_bot_reactor_is_gated(self):
+    async def test_foreign_bot_reactor_dropped_when_bots_disallowed(self, monkeypatch):
+        # Default allow_bots="none": a bot reactor is dropped, and must NOT
+        # consume the once-per-message summon slot.
+        monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
         adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        client.users_info.return_value = {"ok": True, "user": {"is_bot": True}}
+        await adapter._handle_slack_reaction_added(_reaction_event(user="U_OTHER_BOT"))
+        adapter._handle_slack_message.assert_not_awaited()
+
+        # A human then reacts with the same emoji on the same message: the slot
+        # was not consumed, so this summons.
+        client.users_info.return_value = {"ok": True, "user": {"is_bot": False}}
+        await adapter._handle_slack_reaction_added(_reaction_event(user=REACTOR_ID))
+        adapter._handle_slack_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_foreign_bot_reactor_stamped_when_bots_allowed(self, monkeypatch):
+        monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        adapter.config.extra["allow_bots"] = "all"
         client.users_info.return_value = {"ok": True, "user": {"is_bot": True}}
 
         await adapter._handle_slack_reaction_added(_reaction_event(user="U_OTHER_BOT"))
 
-        # Summon still replays, but stamped with bot_id so _handle_slack_message's
-        # allow_bots policy decides — it does not silently bypass gating.
+        # Bots allowed → summon replays, stamped with bot_id so the pipeline's
+        # allow_bots policy still governs it rather than being bypassed.
         adapter._handle_slack_message.assert_awaited_once()
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic.get("bot_id")
+
+    @pytest.mark.asyncio
+    async def test_team_id_recovered_from_outer_body(self):
+        # The inner reaction event has no team; the outer Bolt body carries it.
+        adapter, client = _make_adapter(reaction_triggers=["hermes"])
+        await adapter._handle_slack_reaction_added(
+            _reaction_event(), body={"team_id": "T_OUTER"}
+        )
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["team"] == "T_OUTER"
+        assert adapter._channel_team[CHANNEL_ID] == "T_OUTER"
 
     @pytest.mark.asyncio
     async def test_failed_fetch_can_be_retried(self):

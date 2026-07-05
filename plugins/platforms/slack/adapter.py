@@ -1151,13 +1151,16 @@ class SlackAdapter(BasePlatformAdapter):
             # message (threaded reply). Otherwise the handler falls through
             # to a plain ack so high-traffic channels do not fill
             # gateway.error.log with Slack Bolt "Unhandled request" warnings.
+            # ``body`` carries the outer envelope — the reliable source of the
+            # workspace team id, which the inner reaction ``event`` often omits
+            # on multi-workspace installs.
             @self._app.event("reaction_added")
-            async def handle_reaction_added(event, say):
-                await self._handle_slack_reaction_added(event)
+            async def handle_reaction_added(event, body, say):
+                await self._handle_slack_reaction_added(event, body)
 
             @self._app.event("reaction_removed")
-            async def handle_reaction_removed(event, say):
-                await self._handle_slack_reaction_removed(event)
+            async def handle_reaction_removed(event, body, say):
+                await self._handle_slack_reaction_removed(event, body)
 
             @self._app.event("assistant_thread_started")
             async def handle_assistant_thread_started(event, say):
@@ -2100,14 +2103,47 @@ class SlackAdapter(BasePlatformAdapter):
         self._reaction_trigger_emojis_cache = emojis
         return emojis
 
-    def _parse_reaction_event(self, event: dict) -> Optional[_ReactionContext]:
+    def _slack_allow_bots(self) -> str:
+        """Return the normalized ``allow_bots`` policy: none / mentions / all.
+
+        Single source mirroring the inline read in ``_handle_slack_message``
+        so the reaction handlers can apply the same policy to bot reactors
+        before doing summon-side work.
+        """
+        allow_bots = self.config.extra.get("allow_bots", "") if self.config.extra else ""
+        if not allow_bots:
+            allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
+        return str(allow_bots).lower().strip()
+
+    @staticmethod
+    def _reaction_team_from_body(body: Optional[dict]) -> str:
+        """Extract the workspace team id from a Bolt event envelope.
+
+        The inner ``reaction_added`` / ``reaction_removed`` event frequently
+        omits the team id; the outer body carries it at the top level and in
+        ``authorizations``.
+        """
+        if not isinstance(body, dict):
+            return ""
+        team = body.get("team_id") or body.get("team") or ""
+        if not team:
+            for auth in body.get("authorizations") or []:
+                if isinstance(auth, dict) and auth.get("team_id"):
+                    return auth["team_id"]
+        return team
+
+    def _parse_reaction_event(
+        self, event: dict, body: Optional[dict] = None
+    ) -> Optional[_ReactionContext]:
         """Validate a reaction event and extract the fields both handlers need.
 
         Returns ``None`` (caller should ack and stop) unless: reaction
         triggers are configured and this emoji matches, the item is a
         message with a channel + ts, and the reactor is not one of our own
-        bot users. Also seeds ``_channel_team`` so ``_get_client`` resolves
-        the right workspace on multi-workspace installs.
+        bot users. ``body`` is the outer Bolt envelope, used to recover the
+        workspace team id the inner event often omits. Also seeds
+        ``_channel_team`` so ``_get_client`` resolves the right workspace on
+        multi-workspace installs.
         """
         trigger_emojis = self._slack_reaction_trigger_emojis()
         if not trigger_emojis:
@@ -2139,6 +2175,7 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = (
             event.get("team")
             or event.get("team_id")
+            or self._reaction_team_from_body(body)
             or self._channel_team.get(channel_id)
             or ""
         )
@@ -2175,7 +2212,9 @@ class SlackAdapter(BasePlatformAdapter):
             synthetic["team"] = ctx.team_id
         return synthetic
 
-    async def _handle_slack_reaction_added(self, event: dict) -> None:
+    async def _handle_slack_reaction_added(
+        self, event: dict, body: Optional[dict] = None
+    ) -> None:
         """Route an opt-in emoji reaction into the normal message pipeline.
 
         When ``slack.reaction_triggers`` is configured, reacting to a message
@@ -2185,8 +2224,17 @@ class SlackAdapter(BasePlatformAdapter):
         with ``thread_ts`` forced to the reacted message so the reply lands
         in its thread. Without configured triggers this is a no-op ack.
         """
-        ctx = self._parse_reaction_event(event)
+        ctx = self._parse_reaction_event(event, body)
         if ctx is None:
+            return
+
+        # Resolve reactor bot-ness up front. When allow_bots is "none" (the
+        # default) a bot reactor is dropped BEFORE the dedup key is recorded —
+        # otherwise an automation's reaction would consume the once-per-message
+        # slot and block later human reactions until the TTL. (When bots are
+        # allowed, is_bot_reactor is reused below to stamp bot_id.)
+        is_bot_reactor = await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
+        if is_bot_reactor and self._slack_allow_bots() == "none":
             return
 
         # Once per message+emoji: a pile-on of the same reaction from other
@@ -2271,10 +2319,10 @@ class SlackAdapter(BasePlatformAdapter):
         )
         if original.get("files"):
             synthetic_event["files"] = original["files"]
-        # If the reactor is another app/bot, stamp bot_id so the normal
-        # allow_bots policy in _handle_slack_message decides whether to
-        # honour the summon — an automation reacting must not bypass gating.
-        if await self._reactor_is_bot(ctx.user_id, ctx.channel_id):
+        # If the reactor is another app/bot (and bots are allowed, else we
+        # already returned above), stamp bot_id so the normal allow_bots
+        # policy in _handle_slack_message applies to the summon.
+        if is_bot_reactor:
             synthetic_event["bot_id"] = f"reaction:{ctx.user_id}"
 
         logger.info(
@@ -2286,7 +2334,9 @@ class SlackAdapter(BasePlatformAdapter):
         )
         await self._handle_slack_message(synthetic_event)
 
-    async def _handle_slack_reaction_removed(self, event: dict) -> None:
+    async def _handle_slack_reaction_removed(
+        self, event: dict, body: Optional[dict] = None
+    ) -> None:
         """Treat removing a summon emoji from an active thread as ``/stop``.
 
         Symmetric with the summon path: only a configured
@@ -2299,7 +2349,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
 
-        ctx = self._parse_reaction_event(event)
+        ctx = self._parse_reaction_event(event, body)
         if ctx is None or not ctx.user_id:
             return
 
@@ -2307,6 +2357,15 @@ class SlackAdapter(BasePlatformAdapter):
         # conversations.info lookup below when nothing is in flight — the
         # common case for a reaction removal.
         if not getattr(self, "_active_sessions", None):
+            return
+
+        # A foreign app/bot must not cancel a human's in-flight turn when bots
+        # are disallowed (default). Checked after the idle short-circuit so an
+        # idle unreact still makes zero API calls.
+        if (
+            await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
+            and self._slack_allow_bots() == "none"
+        ):
             return
 
         channel_type = await self._resolve_reaction_channel_type(ctx.channel_id)
