@@ -188,19 +188,16 @@ class TestParseReactionTriggerEmojis:
         assert _parse_reaction_trigger_emojis({}) == set()
 
     def test_mapping_form(self):
-        raw = {"enabled": True, "emojis": ["hermes", "eyes"]}
-        assert _parse_reaction_trigger_emojis(raw) == {"hermes", "eyes"}
+        assert _parse_reaction_trigger_emojis({"emojis": ["hermes", "eyes"]}) == {
+            "hermes",
+            "eyes",
+        }
 
-    def test_mapping_disabled(self):
+    def test_enabled_key_is_ignored(self):
+        # `enabled` was dropped — presence of emojis is the on/off signal, so a
+        # leftover `enabled: false` no longer disables the feature.
         raw = {"enabled": False, "emojis": ["hermes"]}
-        assert _parse_reaction_trigger_emojis(raw) == set()
-
-    def test_mapping_disabled_string(self):
-        raw = {"enabled": "false", "emojis": ["hermes"]}
-        assert _parse_reaction_trigger_emojis(raw) == set()
-
-    def test_mapping_enabled_defaults_true(self):
-        assert _parse_reaction_trigger_emojis({"emojis": ["hermes"]}) == {"hermes"}
+        assert _parse_reaction_trigger_emojis(raw) == {"hermes"}
 
     def test_bare_list(self):
         assert _parse_reaction_trigger_emojis(["hermes"]) == {"hermes"}
@@ -303,16 +300,15 @@ class TestApplyYamlConfigBridge:
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "placeholder")
         monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS")
         _apply_yaml_config(
-            {}, {"reaction_triggers": {"enabled": True, "emojis": ["hermes", "eyes"]}}
+            {}, {"reaction_triggers": {"emojis": ["hermes", "eyes"]}}
         )
         assert os.environ.get("SLACK_REACTION_TRIGGER_EMOJIS") == "eyes,hermes"
 
-    def test_disabled_not_bridged(self, monkeypatch):
+    def test_empty_emojis_not_bridged(self, monkeypatch):
+        # No emojis → nothing to bridge (the feature stays off).
         monkeypatch.setenv("SLACK_REACTION_TRIGGER_EMOJIS", "placeholder")
         monkeypatch.delenv("SLACK_REACTION_TRIGGER_EMOJIS")
-        _apply_yaml_config(
-            {}, {"reaction_triggers": {"enabled": False, "emojis": ["hermes"]}}
-        )
+        _apply_yaml_config({}, {"reaction_triggers": {"emojis": []}})
         assert os.environ.get("SLACK_REACTION_TRIGGER_EMOJIS") is None
 
     def test_env_wins_over_yaml(self, monkeypatch):

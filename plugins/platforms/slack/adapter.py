@@ -2110,7 +2110,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         Opt-in: the default is an empty set, which keeps ``reaction_added``
         a plain ack. Reads ``slack.reaction_triggers`` from config.yaml
-        (a ``{enabled, emojis}`` mapping, a bare list, or a CSV string),
+        (a bare list, an ``{emojis: [...]}`` mapping, or a CSV string),
         falling back to the ``SLACK_REACTION_TRIGGER_EMOJIS`` env var. The
         parsed set is cached — this runs on every reaction event and the
         config is fixed at runtime (mirrors ``_slack_mention_patterns``).
@@ -5081,19 +5081,15 @@ def interactive_setup() -> None:
 def _parse_reaction_trigger_emojis(raw) -> set:
     """Normalise a ``reaction_triggers`` config value into a set of emoji names.
 
-    Accepts the documented mapping form (``{enabled: bool, emojis: [...]}``),
-    a bare list of names, or a CSV string (the env-var form). Emoji names are
-    lowercased with surrounding colons stripped, so ``:hermes:`` and
-    ``hermes`` are equivalent. Returns an empty set when disabled or empty.
+    Accepts a bare list of names, a mapping with an ``emojis`` key, or a CSV
+    string (the env-var form). Emoji names are lowercased with surrounding
+    colons stripped, so ``:hermes:`` and ``hermes`` are equivalent. Presence
+    of any emoji is what enables the feature — an empty/absent value keeps it
+    off (consistent with free_response_channels / allowed_channels).
     """
     if raw is None:
         return set()
     if isinstance(raw, dict):
-        enabled = raw.get("enabled", True)
-        if isinstance(enabled, str):
-            enabled = enabled.lower() not in {"false", "0", "no", "off"}
-        if not enabled:
-            return set()
         raw = raw.get("emojis")
     if isinstance(raw, str):
         raw = raw.split(",")

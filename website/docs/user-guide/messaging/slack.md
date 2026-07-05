@@ -430,11 +430,12 @@ Opt-in: summon the bot onto any message by reacting to it with a configured emoj
 ```yaml
 slack:
   reaction_triggers:
-    enabled: true        # optional, defaults to true when emojis are set
     emojis:
       - hermes           # emoji names without colons
       - eyes
 ```
+
+Listing at least one emoji is what turns the feature on — there's no separate `enabled` flag (an empty or absent list leaves it off, like `free_response_channels` and `allowed_channels`).
 
 Shorthand and environment-variable forms are also accepted:
 
