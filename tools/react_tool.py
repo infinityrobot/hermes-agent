@@ -79,8 +79,13 @@ REACT_SCHEMA = {
         "'thumbsup', '+1', 'pray', 'tada'). By default it reacts to the most "
         "recent message in this chat — the one you're responding to — so you "
         "usually don't need `message_id`. Set `remove: true` to retract a "
-        "reaction. Reacting is often a COMPLETE response on its own: you can "
-        "react and send no message at all."
+        "reaction.\n\n"
+        "IMPORTANT: the reaction IS your response. After calling this tool, do "
+        "NOT also send a text message that announces or describes the reaction "
+        "(no 'reacted with :tada:', no 'ok 👍') — that defeats the purpose and "
+        "reads as noise. Say nothing further unless you have genuinely useful "
+        "extra detail to add; if you do, it should stand on its own, not "
+        "narrate the emoji."
     ),
     "parameters": {
         "type": "object",
