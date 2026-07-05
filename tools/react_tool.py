@@ -52,9 +52,17 @@ def react_tool(
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
-    if isinstance(result, dict):
-        return json.dumps(result, ensure_ascii=False)
-    return json.dumps({"success": bool(result)}, ensure_ascii=False)
+    if not isinstance(result, dict):
+        result = {"success": bool(result)}
+    if result.get("success") and not remove:
+        # Read by the model right before it decides its final reply — the
+        # strongest place to stop the reflexive "Done." confirmation.
+        result["note"] = (
+            "Reaction posted. This completes your response — end your turn now "
+            "with NO further message (no 'Done.', 'ok', acknowledgement, or "
+            "emoji). Reply only if you have new, substantive information to add."
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 def check_react_requirements() -> bool:
@@ -80,12 +88,14 @@ REACT_SCHEMA = {
         "recent message in this chat — the one you're responding to — so you "
         "usually don't need `message_id`. Set `remove: true` to retract a "
         "reaction.\n\n"
-        "IMPORTANT: the reaction IS your response. After calling this tool, do "
-        "NOT also send a text message that announces or describes the reaction "
-        "(no 'reacted with :tada:', no 'ok 👍') — that defeats the purpose and "
-        "reads as noise. Say nothing further unless you have genuinely useful "
-        "extra detail to add; if you do, it should stand on its own, not "
-        "narrate the emoji."
+        "IMPORTANT: the reaction IS your entire response. After calling this "
+        "tool, END YOUR TURN WITH NO TEXT AT ALL — do not send any closing or "
+        "confirmation message. That means no 'Done.', 'Sure.', 'Got it.', "
+        "'ok', no 'reacted with :tada:', and not even a lone emoji. Sending "
+        "anything after the reaction defeats the purpose and reads as noise. "
+        "Send a follow-up message ONLY if it contains new, substantive "
+        "information the reaction itself cannot convey — a bare acknowledgement "
+        "never qualifies."
     ),
     "parameters": {
         "type": "object",

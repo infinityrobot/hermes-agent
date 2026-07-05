@@ -26,6 +26,8 @@ def test_strips_colons_and_passes_through():
     assert out["emoji"] == "tada"
     assert out["message_id"] == "123.45"
     assert out["remove"] is False
+    # Success result nudges the model to stop after reacting (no "Done.").
+    assert "no further message" in out["note"].lower() or "end your turn" in out["note"].lower()
 
 
 def test_remove_needs_no_emoji():
