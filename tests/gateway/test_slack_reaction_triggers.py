@@ -93,6 +93,7 @@ def _make_adapter(reaction_trigger_emojis=None, agent_reactions=None):
     adapter._last_inbound_ts = {}
     adapter._active_sessions = {}
     adapter._session_store = None
+    adapter._authorization_check = None
 
     client = MagicMock()
     client.conversations_replies = AsyncMock(
@@ -755,13 +756,6 @@ class TestReactionSummonLifecycle:
         # synthetic ts (EVENT_TS) redirects to the reacted message (MSG_TS).
         assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS
 
-    @pytest.mark.asyncio
-    async def test_summon_no_lifecycle_target_when_reactions_disabled(self, monkeypatch):
-        monkeypatch.setenv("SLACK_REACTIONS", "false")
-        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
-        await adapter._handle_slack_reaction_added(_reaction_event())
-        assert adapter._reaction_lifecycle_target == {}
-
     def _event(self):
         from types import SimpleNamespace
 
@@ -925,3 +919,41 @@ class TestReactionsToggle:
         monkeypatch.setenv("SLACK_REACTIONS", "false")
         adapter, _ = _make_adapter()
         assert adapter._reactions_enabled() is False
+
+
+class TestReactionCodexFixes:
+    """Regressions for the two codex-review P2 findings."""
+
+    @pytest.mark.asyncio
+    async def test_agent_react_on_summon_turn_targets_real_message(self):
+        # During a summon-launched turn, message_id is the synthetic event_ts;
+        # add_reaction must resolve it back to the real reacted message.
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._reaction_lifecycle_target[EVENT_TS] = MSG_TS  # synthetic → real
+        result = await adapter.add_reaction(CHANNEL_ID, "tada", message_id=EVENT_TS)
+        assert result["success"] is True
+        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_reactor_does_not_consume_summon_slot(self):
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
+        # Only REACTOR_ID is authorized.
+        adapter._authorization_check = lambda uid, ct, cid: uid == REACTOR_ID
+
+        # An unauthorized user reacts first — dropped, slot NOT consumed.
+        await adapter._handle_slack_reaction_added(_reaction_event(user="U_STRANGER"))
+        adapter._handle_slack_message.assert_not_awaited()
+
+        # The authorized user then reacts with the same emoji → summons.
+        await adapter._handle_slack_reaction_added(_reaction_event(user=REACTOR_ID))
+        adapter._handle_slack_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_summon_registers_lifecycle_target_even_when_status_off(self, monkeypatch):
+        # Murphy's config: status reactions off, agent reactions on. The
+        # synthetic→real map must still be populated so agent reactions resolve.
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
+        await adapter._handle_slack_reaction_added(_reaction_event())
+        assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS

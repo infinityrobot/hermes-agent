@@ -2120,7 +2120,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "success": False,
                 "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
             }
-        ts = message_id or self._last_inbound_ts.get(chat_id)
+        # On a summon-launched turn the default target is the synthetic
+        # reaction event_ts — map it back to the real reacted message.
+        ts = self._reaction_lifecycle_ts(
+            message_id or self._last_inbound_ts.get(chat_id)
+        )
         if not ts:
             return {
                 "success": False,
@@ -2150,7 +2154,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "success": False,
                 "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
             }
-        ts = message_id or self._last_inbound_ts.get(chat_id)
+        # On a summon-launched turn the default target is the synthetic
+        # reaction event_ts — map it back to the real reacted message.
+        ts = self._reaction_lifecycle_ts(
+            message_id or self._last_inbound_ts.get(chat_id)
+        )
         if not ts:
             return {"success": False, "error": "No target message; pass message_id."}
 
@@ -2386,6 +2394,13 @@ class SlackAdapter(BasePlatformAdapter):
         if self._reaction_summon_dedup.is_duplicate(summon_key):
             return
 
+        # An unauthorized reactor's summon would be dropped by gateway auth on
+        # replay anyway — reject it here (in-memory) and discard the key so it
+        # doesn't block a later authorized user from summoning on this message.
+        if self._is_sender_authorized(ctx.user_id, chat_id=ctx.channel_id) is False:
+            self._reaction_summon_dedup.discard(summon_key)
+            return
+
         # A bot reactor is dropped when allow_bots is "none" (the default);
         # discard the just-recorded key so it doesn't block a later human
         # reaction on this message. (When bots are allowed, is_bot_reactor is
@@ -2463,11 +2478,14 @@ class SlackAdapter(BasePlatformAdapter):
         # policy in _handle_slack_message applies to the summon.
         if is_bot_reactor:
             synthetic_event["bot_id"] = f"reaction:{ctx.user_id}"
-        # Route the :eyes:/done reaction lifecycle onto the ORIGINAL reacted
-        # message: the synthetic ts is a reaction event_ts, not a real message
-        # ts, so reacting to it would no-op. Registered before the replay so
-        # on_processing_start (fired inside _handle_slack_message) can find it.
-        if self._reactions_enabled() and synthetic_event.get("ts"):
+        # Map the synthetic event ts → the ORIGINAL reacted message, so any
+        # reaction during this turn lands on a real message (the synthetic ts
+        # is a reaction event_ts). Used both by the :eyes:/done status
+        # lifecycle (on_processing_start/complete) AND by agent-initiated
+        # reactions defaulting to "the message being replied to". Registered
+        # unconditionally (not gated on the status toggle) so agent reactions
+        # resolve correctly even when status markers are off.
+        if synthetic_event.get("ts"):
             self._reaction_lifecycle_target[synthetic_event["ts"]] = ctx.message_ts
 
         logger.info(
@@ -2772,15 +2790,19 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        ts = getattr(event, "message_id", None)
+        # Always release the synthetic→real target for this turn (it's
+        # populated for every summon, regardless of the status toggle), so the
+        # map can't leak when status reactions are off.
+        react_ts = self._reaction_lifecycle_ts(ts) if ts else ts
+        if ts:
+            self._reaction_lifecycle_target.pop(ts, None)
         if not self._reactions_enabled():
             return
-        ts = getattr(event, "message_id", None)
         if not ts or ts not in self._reacting_message_ids:
             return
         self._reacting_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
-        react_ts = self._reaction_lifecycle_ts(ts)
-        getattr(self, "_reaction_lifecycle_target", {}).pop(ts, None)
         if not channel_id:
             return
         emojis = self._slack_reaction_status_emojis()
