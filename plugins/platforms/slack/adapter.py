@@ -2330,13 +2330,21 @@ class SlackAdapter(BasePlatformAdapter):
         channel_type: str,
         thread_ts: str,
         event_ts: str,
+        mention: bool = True,
     ) -> dict:
         """Build the base synthetic message event replayed by both handlers.
 
         ``event_ts`` (not the original message ts) is used as ``ts`` so the
         message deduper does not suppress reactions on already-processed
-        messages. Callers layer on extras (``files``, ``bot_id``).
+        messages. When ``mention`` is set (the default), a literal bot mention
+        is prefixed so the pipeline treats the replay as an explicit @mention
+        (passes mention gating, registers the thread); it strips the mention
+        before the agent sees it. Callers layer on extras (``files``, ``bot_id``).
         """
+        if mention:
+            bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
+            if bot_uid:
+                text = f"<@{bot_uid}> {text}"
         synthetic: dict = {
             "type": "message",
             "text": text,
@@ -2370,21 +2378,21 @@ class SlackAdapter(BasePlatformAdapter):
         if ctx is None:
             return
 
-        # Resolve reactor bot-ness up front. When allow_bots is "none" (the
-        # default) a bot reactor is dropped BEFORE the dedup key is recorded —
-        # otherwise an automation's reaction would consume the once-per-message
-        # slot and block later human reactions until the TTL. (When bots are
-        # allowed, is_bot_reactor is reused below to stamp bot_id.)
-        is_bot_reactor = await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
-        if is_bot_reactor and self._slack_allow_bots() == "none":
-            return
-
         # Once per message+emoji: a pile-on of the same reaction from other
-        # users (or a Socket Mode redelivery) must not summon repeatedly.
-        # Recorded before the fetch so concurrent reactors collapse to one
-        # summon; discarded on fetch failure so an invite-and-retry works.
+        # users (or a Socket Mode redelivery) must not summon repeatedly. The
+        # in-memory dedup runs first (before the users.info bot lookup below),
+        # so redelivered/pile-on duplicates short-circuit without an API call.
         summon_key = f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
         if self._reaction_summon_dedup.is_duplicate(summon_key):
+            return
+
+        # A bot reactor is dropped when allow_bots is "none" (the default);
+        # discard the just-recorded key so it doesn't block a later human
+        # reaction on this message. (When bots are allowed, is_bot_reactor is
+        # reused below to stamp bot_id.)
+        is_bot_reactor = await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
+        if is_bot_reactor and self._slack_allow_bots() == "none":
+            self._reaction_summon_dedup.discard(summon_key)
             return
 
         original, error_detail = await self._fetch_slack_message_for_reaction(
@@ -2422,7 +2430,6 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             return
 
-        bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
         author_id = original.get("user") or event.get("item_user") or ""
 
         reactor_ref = f"<@{ctx.user_id}>" if ctx.user_id else "Someone"
@@ -2437,13 +2444,6 @@ class SlackAdapter(BasePlatformAdapter):
             f"{reactor_ref} reacted with :{ctx.emoji}: to summon you on this "
             f"message from {author_ref}:\n{quoted}"
         )
-        # Prefix a literal bot mention so the message pipeline treats the
-        # summon as an explicit @mention (passes mention gating, earns the
-        # reaction lifecycle, registers the thread). The pipeline strips it
-        # from the text the agent sees.
-        if bot_uid:
-            summon_text = f"<@{bot_uid}> {summon_text}"
-
         synthetic_event = self._build_reaction_synthetic_event(
             text=summon_text,
             ctx=ctx,
@@ -2513,27 +2513,24 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_type = await self._resolve_reaction_channel_type(ctx.channel_id)
 
+        def _active(candidate_ts: str) -> bool:
+            return self._slack_thread_session_is_active(
+                channel_id=ctx.channel_id,
+                thread_ts=candidate_ts,
+                user_id=ctx.user_id,
+                channel_type=channel_type,
+            )
+
         # The reaction may sit on a thread root or on a reply; find the active
         # thread. Fetch (to learn the parent root) only if the direct hit misses.
         thread_ts = ctx.message_ts
-        if not self._slack_thread_session_is_active(
-            channel_id=ctx.channel_id,
-            thread_ts=thread_ts,
-            user_id=ctx.user_id,
-            channel_type=channel_type,
-        ):
+        if not _active(thread_ts):
             original, _error_detail = await self._fetch_slack_message_for_reaction(
                 ctx.channel_id, ctx.message_ts
             )
             parent_ts = (original or {}).get("thread_ts")
-            if not parent_ts or parent_ts == thread_ts:
-                return  # top-level message, and its own thread wasn't active
-            if not self._slack_thread_session_is_active(
-                channel_id=ctx.channel_id,
-                thread_ts=parent_ts,
-                user_id=ctx.user_id,
-                channel_type=channel_type,
-            ):
+            # No distinct parent thread, or its thread isn't active either → ack.
+            if not parent_ts or parent_ts == thread_ts or not _active(parent_ts):
                 return
             thread_ts = parent_ts
 
@@ -2543,15 +2540,8 @@ class SlackAdapter(BasePlatformAdapter):
             f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
         )
 
-        bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
-        stop_text = "/stop"
-        if bot_uid:
-            # Force mention-gating to admit the control event; _handle_slack_message
-            # strips the mention before MessageEvent reaches the gateway.
-            stop_text = f"<@{bot_uid}> {stop_text}"
-
         synthetic_event = self._build_reaction_synthetic_event(
-            text=stop_text,
+            text="/stop",
             ctx=ctx,
             channel_type=channel_type,
             thread_ts=thread_ts,
@@ -3324,10 +3314,7 @@ class SlackAdapter(BasePlatformAdapter):
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
-            allow_bots = self.config.extra.get("allow_bots", "")
-            if not allow_bots:
-                allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
-            allow_bots = str(allow_bots).lower().strip()
+            allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
