@@ -18292,17 +18292,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "success": False,
                         "error": "This platform does not support reactions.",
                     }
+                # Default to THIS turn's triggering message so "the message
+                # you're replying to" is literally true, rather than relying on
+                # the adapter's channel-global last-inbound fallback (which can
+                # race across concurrent addressed threads in one channel).
+                target_message_id = message_id or event_message_id
                 if remove:
                     # Forward the emoji so the model can retract a specific
                     # reaction; adapters treat emoji=None as "remove my own".
                     coro = fn(
                         chat_id=_status_chat_id,
-                        message_id=message_id,
+                        message_id=target_message_id,
                         emoji=(emoji or None),
                     )
                 else:
                     coro = fn(
-                        chat_id=_status_chat_id, emoji=emoji, message_id=message_id
+                        chat_id=_status_chat_id,
+                        emoji=emoji,
+                        message_id=target_message_id,
                     )
                 fut = safe_schedule_threadsafe(
                     coro,
