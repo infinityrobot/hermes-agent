@@ -16,7 +16,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any, Tuple, List
+from typing import Dict, Optional, Any, Tuple, List, NamedTuple
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -402,6 +402,21 @@ def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
     return name.startswith("audio_message")
 
 
+class _ReactionContext(NamedTuple):
+    """Validated fields shared by the reaction_added / reaction_removed paths.
+
+    Produced by ``SlackAdapter._parse_reaction_event`` once the cheap
+    in-memory gates (trigger-emoji allowlist, message-item type, self-bot
+    reactor) have all passed.
+    """
+
+    emoji: str
+    channel_id: str
+    message_ts: str
+    user_id: str
+    team_id: str
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -419,6 +434,10 @@ class SlackAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
+    # When fetching a reacted message we page the thread so a reacted reply
+    # (not just the thread root) is in the result to scan for. Bounded so a
+    # huge thread does not pull an unbounded page.
+    _REACTION_FETCH_THREAD_LIMIT = 200
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
@@ -471,6 +490,26 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        # Most-recent inbound (real) message ts per channel, so agent-initiated
+        # reactions can default to "the message being replied to".
+        self._last_inbound_ts: Dict[str, str] = {}
+        # Reaction-summon dedup: once per team:channel:ts:emoji, so a pile-on
+        # of the same emoji (or a Socket Mode redelivery) only summons once.
+        # Uses the shared TTL/bounded helper (correct oldest-first eviction);
+        # a failed summon is discard()ed so an invite-and-retry works.
+        self._reaction_summon_dedup = MessageDeduplicator(max_size=5000)
+        # Per-channel conversation type cache (im / mpim / channel) so
+        # reaction-driven synthetic events key their session the same way a
+        # real message in that conversation would.
+        self._reaction_channel_type: Dict[str, str] = {}
+        # Reactor bot-ness cache (user_id → is_bot) to gate reactions from
+        # other apps through the normal allow_bots policy without a
+        # users.info call per event.
+        self._reactor_is_bot_cache: Dict[str, bool] = {}
+        # Redirects the :eyes:/done reaction lifecycle for a reaction summon
+        # from its synthetic event ts (a reaction event_ts, not a real message
+        # ts) onto the ORIGINAL reacted message: {synthetic_ts → message_ts}.
+        self._reaction_lifecycle_target: Dict[str, str] = {}
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
@@ -1114,17 +1153,21 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_file_change(event, say):
                 pass
 
-            # Reactions are useful lightweight acknowledgements in Slack, but
-            # Hermes does not currently need to route them into the agent loop.
-            # Ack the events explicitly so high-traffic channels do not fill
+            # Reactions: when ``slack.reaction_trigger_emojis`` is configured, a
+            # matching emoji reaction "summons" the bot onto the reacted
+            # message (threaded reply). Otherwise the handler falls through
+            # to a plain ack so high-traffic channels do not fill
             # gateway.error.log with Slack Bolt "Unhandled request" warnings.
+            # ``body`` carries the outer envelope — the reliable source of the
+            # workspace team id, which the inner reaction ``event`` often omits
+            # on multi-workspace installs.
             @self._app.event("reaction_added")
-            async def handle_reaction_added(event, say):
-                pass
+            async def handle_reaction_added(event, body, say):
+                await self._handle_slack_reaction_added(event, body)
 
             @self._app.event("reaction_removed")
-            async def handle_reaction_removed(event, say):
-                pass
+            async def handle_reaction_removed(event, body, say):
+                await self._handle_slack_reaction_removed(event, body)
 
             @self._app.event("assistant_thread_started")
             async def handle_assistant_thread_started(event, say):
@@ -2040,9 +2083,693 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.remove failed (%s): %s", emoji, e)
             return False
 
+    # ----- Agent-initiated reactions (opt-in) -----
+
+    def _agent_reactions_enabled(self) -> bool:
+        """Whether the agent may react to messages on its own (opt-in).
+
+        Independent of ``slack.reactions`` (which governs the automatic
+        in-progress/done status markers): this gates deliberate reactions the
+        agent chooses as a form of communication. Default off. Reads
+        ``slack.agent_reactions`` / ``SLACK_AGENT_REACTIONS``.
+        """
+        configured = self.config.extra.get("agent_reactions") if self.config.extra else None
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_AGENT_REACTIONS", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    async def add_reaction(
+        self, chat_id: str, emoji: str, message_id: Optional[str] = None
+    ) -> dict:
+        """Agent-facing: add an emoji reaction to a message.
+
+        Public entry point invoked by the gateway react tool. ``message_id``
+        defaults to the most recent inbound message in ``chat_id`` (the one
+        being replied to). Gated by ``agent_reactions`` — independent of the
+        status-marker toggle.
+        """
+        if not self._agent_reactions_enabled():
+            return {
+                "success": False,
+                "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
+            }
+        # On a summon-launched turn the default target is the synthetic
+        # reaction event_ts — map it back to the real reacted message.
+        ts = self._reaction_lifecycle_ts(
+            message_id or self._last_inbound_ts.get(chat_id)
+        )
+        if not ts:
+            return {
+                "success": False,
+                "error": "No target message; pass message_id.",
+            }
+        name = str(emoji or "").strip().strip(":")
+        if not name:
+            return {"success": False, "error": "emoji is required."}
+        ok = await self._add_reaction(chat_id, ts, name)
+        return {"success": ok, "channel": chat_id, "ts": ts, "emoji": name}
+
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: Optional[str] = None,
+        emoji: Optional[str] = None,
+    ) -> dict:
+        """Agent-facing: retract a reaction.
+
+        With ``emoji`` given, removes that one; otherwise removes the bot's own
+        reactions on the target message (Slack requires naming the emoji, so we
+        look them up). ``message_id`` defaults to the most recent inbound
+        message in ``chat_id``.
+        """
+        if not self._agent_reactions_enabled():
+            return {
+                "success": False,
+                "error": "Agent reactions are disabled. Set slack.agent_reactions: true.",
+            }
+        # On a summon-launched turn the default target is the synthetic
+        # reaction event_ts — map it back to the real reacted message.
+        ts = self._reaction_lifecycle_ts(
+            message_id or self._last_inbound_ts.get(chat_id)
+        )
+        if not ts:
+            return {"success": False, "error": "No target message; pass message_id."}
+
+        names = []
+        if emoji:
+            names = [str(emoji).strip().strip(":")]
+        else:
+            # No emoji named — remove whatever this bot reacted with.
+            try:
+                resp = await self._get_client(chat_id).reactions_get(
+                    channel=chat_id, timestamp=ts
+                )
+                bot_uid = self._bot_user_id
+                for r in ((resp.get("message") or {}).get("reactions")) or []:
+                    if bot_uid and bot_uid in (r.get("users") or []):
+                        names.append(r.get("name"))
+            except Exception as exc:
+                logger.debug("[Slack] reactions.get failed for %s: %s", chat_id, exc)
+        if not names:
+            return {"success": False, "error": "No matching reaction to remove."}
+        removed = 0
+        for name in names:
+            if name and await self._remove_reaction(chat_id, ts, name):
+                removed += 1
+        return {"success": removed > 0, "channel": chat_id, "ts": ts, "removed": removed}
+
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        """Whether the automatic in-progress/done status markers are enabled.
+
+        Reads ``slack.reactions`` from config first (so ``reactions: false`` in
+        config.yaml actually disables them), falling back to the
+        ``SLACK_REACTIONS`` env var. Default on.
+        """
+        configured = self.config.extra.get("reactions") if self.config.extra else None
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("SLACK_REACTIONS", "true").lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
+        }
+
+    def _slack_reaction_status_emojis(self) -> dict:
+        """Return the lifecycle emoji names: {in_progress, done, failed}.
+
+        Configurable via ``slack.reaction_status_emojis`` (a mapping, JSON, or a
+        positional CSV) or ``SLACK_REACTION_STATUS_EMOJIS``, merged over the defaults
+        ``eyes`` / ``white_check_mark`` / ``x``. Cached — read on every
+        processed message.
+        """
+        cached = getattr(self, "_reaction_status_emojis_cache", None)
+        if cached is not None:
+            return cached
+        raw = self.config.extra.get("reaction_status_emojis") if self.config.extra else None
+        if raw is None:
+            raw = os.getenv("SLACK_REACTION_STATUS_EMOJIS", "")
+        emojis = _parse_reaction_status_emojis(raw)
+        self._reaction_status_emojis_cache = emojis
+        return emojis
+
+    # ----- Reaction triggers (emoji summon) -----
+
+    def _slack_reaction_trigger_emojis(self) -> set:
+        """Return emoji names (without colons) that summon the bot when used
+        as reactions.
+
+        Opt-in: the default is an empty set, which keeps ``reaction_added``
+        a plain ack. Reads ``slack.reaction_trigger_emojis`` from config.yaml
+        (a bare list, an ``{emojis: [...]}`` mapping, or a CSV string),
+        falling back to the ``SLACK_REACTION_TRIGGER_EMOJIS`` env var. The
+        parsed set is cached — this runs on every reaction event and the
+        config is fixed at runtime (mirrors ``_slack_mention_patterns``).
+        """
+        cached = getattr(self, "_reaction_trigger_emojis_cache", None)
+        if cached is not None:
+            return cached
+        raw = (
+            self.config.extra.get("reaction_trigger_emojis")
+            if self.config.extra
+            else None
+        )
+        if raw is None:
+            raw = os.getenv("SLACK_REACTION_TRIGGER_EMOJIS", "")
+        emojis = _parse_reaction_trigger_emojis(raw)
+        self._reaction_trigger_emojis_cache = emojis
+        return emojis
+
+    def _slack_allow_bots(self) -> str:
+        """Return the normalized ``allow_bots`` policy: none / mentions / all.
+
+        Single source mirroring the inline read in ``_handle_slack_message``
+        so the reaction handlers can apply the same policy to bot reactors
+        before doing summon-side work.
+        """
+        allow_bots = self.config.extra.get("allow_bots", "") if self.config.extra else ""
+        if not allow_bots:
+            allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
+        return str(allow_bots).lower().strip()
+
+    @staticmethod
+    def _reaction_team_from_body(body: Optional[dict]) -> str:
+        """Extract the workspace team id from a Bolt event envelope.
+
+        The inner ``reaction_added`` / ``reaction_removed`` event frequently
+        omits the team id; the outer body carries it at the top level and in
+        ``authorizations``.
+        """
+        if not isinstance(body, dict):
+            return ""
+        team = body.get("team_id") or body.get("team") or ""
+        if not team:
+            for auth in body.get("authorizations") or []:
+                if isinstance(auth, dict) and auth.get("team_id"):
+                    return auth["team_id"]
+        return team
+
+    def _parse_reaction_event(
+        self, event: dict, body: Optional[dict] = None
+    ) -> Optional[_ReactionContext]:
+        """Validate a reaction event and extract the fields both handlers need.
+
+        Returns ``None`` (caller should ack and stop) unless: reaction
+        triggers are configured and this emoji matches, the item is a
+        message with a channel + ts, and the reactor is not one of our own
+        bot users. ``body`` is the outer Bolt envelope, used to recover the
+        workspace team id the inner event often omits. Also seeds
+        ``_channel_team`` so ``_get_client`` resolves the right workspace on
+        multi-workspace installs.
+        """
+        trigger_emojis = self._slack_reaction_trigger_emojis()
+        if not trigger_emojis:
+            return None
+
+        # Normalise skin-tone variants ("thumbsup::skin-tone-2") to the base
+        # name so a toned reaction still matches its configured emoji.
+        emoji = str(event.get("reaction") or "").split("::", 1)[0].strip().strip(":").lower()
+        if not emoji or emoji not in trigger_emojis:
+            return None
+
+        item = event.get("item") or {}
+        if item.get("type") != "message":
+            return None  # file / file_comment reactions are not supported
+        channel_id = item.get("channel") or ""
+        message_ts = item.get("ts") or ""
+        if not channel_id or not message_ts:
+            return None
+
+        # Never let the bot act on its own reactions (lifecycle :eyes: /
+        # :white_check_mark:, or a summon emoji it echoes back).
+        user_id = event.get("user") or ""
+        if user_id and (
+            user_id == self._bot_user_id
+            or user_id in self._team_bot_user_ids.values()
+        ):
+            return None
+
+        team_id = (
+            event.get("team")
+            or event.get("team_id")
+            or self._reaction_team_from_body(body)
+            or self._channel_team.get(channel_id)
+            or ""
+        )
+        if team_id:
+            self._channel_team.setdefault(channel_id, team_id)
+
+        return _ReactionContext(emoji, channel_id, message_ts, user_id, team_id)
+
+    def _build_reaction_synthetic_event(
+        self,
+        *,
+        text: str,
+        ctx: _ReactionContext,
+        channel_type: str,
+        thread_ts: str,
+        event_ts: str,
+        mention: bool = True,
+    ) -> dict:
+        """Build the base synthetic message event replayed by both handlers.
+
+        ``event_ts`` (not the original message ts) is used as ``ts`` so the
+        message deduper does not suppress reactions on already-processed
+        messages. When ``mention`` is set (the default), a literal bot mention
+        is prefixed so the pipeline treats the replay as an explicit @mention
+        (passes mention gating, registers the thread); it strips the mention
+        before the agent sees it. Callers layer on extras (``files``, ``bot_id``).
+        """
+        if mention:
+            bot_uid = self._team_bot_user_ids.get(ctx.team_id) or self._bot_user_id
+            if bot_uid:
+                text = f"<@{bot_uid}> {text}"
+        synthetic: dict = {
+            "type": "message",
+            "text": text,
+            "user": ctx.user_id,
+            "channel": ctx.channel_id,
+            "channel_type": channel_type,
+            "ts": event_ts,
+            "thread_ts": thread_ts,
+            # Marks a reaction-driven replay so downstream logic (e.g.
+            # last-inbound tracking) can tell it from a real user message —
+            # its ts is a reaction event_ts, not a posted message.
+            "_reaction_synthetic": True,
+        }
+        if ctx.team_id:
+            synthetic["team"] = ctx.team_id
+        return synthetic
+
+    async def _handle_slack_reaction_added(
+        self, event: dict, body: Optional[dict] = None
+    ) -> None:
+        """Route an opt-in emoji reaction into the normal message pipeline.
+
+        When ``slack.reaction_trigger_emojis`` is configured, reacting to a message
+        with one of the listed emojis summons the bot on that message: the
+        reacted message is fetched and replayed through
+        ``_handle_slack_message`` as if the reactor had @mentioned the bot,
+        with ``thread_ts`` forced to the reacted message so the reply lands
+        in its thread. Without configured triggers this is a no-op ack.
+        """
+        ctx = self._parse_reaction_event(event, body)
+        if ctx is None:
+            return
+
+        # Once per message+emoji: a pile-on of the same reaction from other
+        # users (or a Socket Mode redelivery) must not summon repeatedly. The
+        # in-memory dedup runs first (before the users.info bot lookup below),
+        # so redelivered/pile-on duplicates short-circuit without an API call.
+        summon_key = f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
+        if self._reaction_summon_dedup.is_duplicate(summon_key):
+            return
+
+        # An unauthorized reactor's summon would be dropped by gateway auth on
+        # replay anyway — reject it here (in-memory) and discard the key so it
+        # doesn't block a later authorized user from summoning on this message.
+        if self._is_sender_authorized(ctx.user_id, chat_id=ctx.channel_id) is False:
+            self._reaction_summon_dedup.discard(summon_key)
+            return
+
+        # A bot reactor is dropped when allow_bots is "none" (the default);
+        # discard the just-recorded key so it doesn't block a later human
+        # reaction on this message. (When bots are allowed, is_bot_reactor is
+        # reused below to stamp bot_id.)
+        is_bot_reactor = await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
+        if is_bot_reactor and self._slack_allow_bots() == "none":
+            self._reaction_summon_dedup.discard(summon_key)
+            return
+
+        original, error_detail = await self._fetch_slack_message_for_reaction(
+            ctx.channel_id, ctx.message_ts
+        )
+        if original is None:
+            # Most fetch failures are access problems (not_in_channel,
+            # channel_not_found, missing_scope). Leave a clear note in the
+            # thread; if we cannot even post there, log and give up quietly.
+            # Discard the dedup key so the retry we just told the user to do
+            # is not silently swallowed.
+            self._reaction_summon_dedup.discard(summon_key)
+            logger.warning(
+                "[Slack] Reaction trigger :%s: could not fetch message %s in %s: %s",
+                ctx.emoji,
+                ctx.message_ts,
+                ctx.channel_id,
+                error_detail or "unknown error",
+            )
+            try:
+                await self._get_client(ctx.channel_id).chat_postMessage(
+                    channel=ctx.channel_id,
+                    thread_ts=ctx.message_ts,
+                    text=(
+                        f"I saw the :{ctx.emoji}: reaction, but I don't have access "
+                        "to that message or channel. Invite me to the channel "
+                        "and try again."
+                    ),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[Slack] Reaction trigger access notice failed for %s: %s",
+                    ctx.channel_id,
+                    exc,
+                )
+            return
+
+        author_id = original.get("user") or event.get("item_user") or ""
+
+        reactor_ref = f"<@{ctx.user_id}>" if ctx.user_id else "Someone"
+        author_ref = f"<@{author_id}>" if author_id else "someone"
+        original_text = (original.get("text") or "").strip()
+        quoted = (
+            "\n".join("> " + line for line in original_text.splitlines())
+            if original_text
+            else "> (no text content)"
+        )
+        summon_text = (
+            f"{reactor_ref} reacted with :{ctx.emoji}: to summon you on this "
+            f"message from {author_ref}:\n{quoted}"
+        )
+        synthetic_event = self._build_reaction_synthetic_event(
+            text=summon_text,
+            ctx=ctx,
+            # Resolve the real conversation type (im / mpim / channel) so the
+            # summon session keys the same as a real message here — a group
+            # DM must not be mis-keyed as a public channel.
+            channel_type=await self._resolve_reaction_channel_type(ctx.channel_id),
+            # Force the reply into the reacted message's thread (or the
+            # message itself as thread root if it is top-level).
+            thread_ts=original.get("thread_ts") or ctx.message_ts,
+            event_ts=event.get("event_ts") or "",
+        )
+        if original.get("files"):
+            synthetic_event["files"] = original["files"]
+        # If the reactor is another app/bot (and bots are allowed, else we
+        # already returned above), stamp bot_id so the normal allow_bots
+        # policy in _handle_slack_message applies to the summon.
+        if is_bot_reactor:
+            synthetic_event["bot_id"] = f"reaction:{ctx.user_id}"
+        # Map the synthetic event ts → the ORIGINAL reacted message, so any
+        # reaction during this turn lands on a real message (the synthetic ts
+        # is a reaction event_ts). Used both by the :eyes:/done status
+        # lifecycle (on_processing_start/complete) AND by agent-initiated
+        # reactions defaulting to "the message being replied to". Registered
+        # unconditionally (not gated on the status toggle) so agent reactions
+        # resolve correctly even when status markers are off.
+        if synthetic_event.get("ts"):
+            self._reaction_lifecycle_target[synthetic_event["ts"]] = ctx.message_ts
+
+        logger.info(
+            "[Slack] Reaction trigger :%s: by %s summoning on %s/%s",
+            ctx.emoji,
+            ctx.user_id or "<unknown>",
+            ctx.channel_id,
+            ctx.message_ts,
+        )
+        await self._handle_slack_message(synthetic_event)
+
+    async def _handle_slack_reaction_removed(
+        self, event: dict, body: Optional[dict] = None
+    ) -> None:
+        """Treat removing a summon emoji from an active thread as ``/stop``.
+
+        Part of the summon feature, so it is gated purely on the summon config
+        (``slack.reaction_trigger_emojis``): only removing a configured summon
+        emoji is a control signal — unreacting a casual :thumbsup: never
+        cancels a turn. It is deliberately NOT gated by ``slack.reactions``
+        (that toggle governs the automatic status markers, a separate feature).
+        Only fires when the reacted message maps to a currently active Hermes
+        session, so ordinary reaction cleanup remains a plain ack.
+        """
+        ctx = self._parse_reaction_event(event, body)
+        if ctx is None or not ctx.user_id:
+            return
+
+        # /stop is only meaningful while a turn is running. Bail before the
+        # conversations.info lookup below when nothing is in flight — the
+        # common case for a reaction removal.
+        if not getattr(self, "_active_sessions", None):
+            return
+
+        # A foreign app/bot must not cancel a human's in-flight turn when bots
+        # are disallowed (default). Checked after the idle short-circuit so an
+        # idle unreact still makes zero API calls.
+        if (
+            await self._reactor_is_bot(ctx.user_id, ctx.channel_id)
+            and self._slack_allow_bots() == "none"
+        ):
+            return
+
+        channel_type = await self._resolve_reaction_channel_type(ctx.channel_id)
+
+        def _active(candidate_ts: str) -> bool:
+            return self._slack_thread_session_is_active(
+                channel_id=ctx.channel_id,
+                thread_ts=candidate_ts,
+                user_id=ctx.user_id,
+                channel_type=channel_type,
+            )
+
+        # The reaction may sit on a thread root or on a reply; find the active
+        # thread. Fetch (to learn the parent root) only if the direct hit misses.
+        thread_ts = ctx.message_ts
+        if not _active(thread_ts):
+            original, _error_detail = await self._fetch_slack_message_for_reaction(
+                ctx.channel_id, ctx.message_ts
+            )
+            parent_ts = (original or {}).get("thread_ts")
+            # No distinct parent thread, or its thread isn't active either → ack.
+            if not parent_ts or parent_ts == thread_ts or not _active(parent_ts):
+                return
+            thread_ts = parent_ts
+
+        # Re-adding the same emoji should be able to summon again after this
+        # stop, so clear the summon dedup for this message+emoji.
+        self._reaction_summon_dedup.discard(
+            f"{ctx.team_id}:{ctx.channel_id}:{ctx.message_ts}:{ctx.emoji}"
+        )
+
+        synthetic_event = self._build_reaction_synthetic_event(
+            text="/stop",
+            ctx=ctx,
+            channel_type=channel_type,
+            thread_ts=thread_ts,
+            event_ts=event.get("event_ts") or "",
+        )
+
+        logger.info(
+            "[Slack] Reaction removal by %s stopping active thread %s/%s",
+            ctx.user_id,
+            ctx.channel_id,
+            thread_ts,
+        )
+        await self._handle_slack_message(synthetic_event)
+
+    def _slack_thread_session_is_active(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+        channel_type: str,
+    ) -> bool:
+        """Return whether the Slack thread maps to an in-flight adapter turn.
+
+        ``/stop`` is only meaningful while a turn is running, so this checks
+        ``_active_sessions`` (the interrupt-guard map populated for the
+        duration of a turn). The session key MUST be built with the same
+        isolation settings the gateway used when it acquired the guard —
+        those live on the session store's config, not ``self.config.extra``
+        (``group_sessions_per_user`` is a gateway-global). Reading them from
+        the wrong place silently mis-keys and the stop never matches.
+        """
+        active_sessions = getattr(self, "_active_sessions", None)
+        if not active_sessions:
+            return False
+        try:
+            from gateway.session import build_session_key
+
+            gspu, tspu = self._session_isolation_settings()
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_name=channel_id,
+                chat_type="dm" if channel_type in {"im", "mpim"} else "group",
+                user_id=user_id,
+                thread_id=thread_ts,
+            )
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=gspu,
+                thread_sessions_per_user=tspu,
+            )
+            return session_key in active_sessions
+        except Exception:
+            logger.debug(
+                "[Slack] Failed to resolve reaction removal session key",
+                exc_info=True,
+            )
+            return False
+
+    def _session_isolation_settings(self) -> Tuple[bool, bool]:
+        """Return ``(group_sessions_per_user, thread_sessions_per_user)``.
+
+        Prefers the live session store's config — the single source of truth
+        the gateway keys sessions with — falling back to platform ``extra``
+        and finally the framework defaults. Mirrors
+        ``_has_active_session_for_thread``.
+        """
+        store_cfg = getattr(getattr(self, "_session_store", None), "config", None)
+        if store_cfg is not None:
+            return (
+                bool(getattr(store_cfg, "group_sessions_per_user", True)),
+                bool(getattr(store_cfg, "thread_sessions_per_user", False)),
+            )
+        extra = self.config.extra or {}
+        return (
+            bool(extra.get("group_sessions_per_user", True)),
+            bool(extra.get("thread_sessions_per_user", False)),
+        )
+
+    async def _resolve_reaction_channel_type(self, channel_id: str) -> str:
+        """Resolve a channel's conversation type for a reaction-driven event.
+
+        Returns one of ``"im"`` / ``"mpim"`` / ``"channel"`` so a synthetic
+        summon/stop event keys its session (and hits mention gating) exactly
+        as a real message in that conversation would. Slack channel-ID
+        prefixes are ambiguous (``G`` covers both private channels and legacy
+        group DMs), so this consults ``conversations.info`` once per channel.
+        Only a successful lookup is cached — a transient failure falls back to
+        the ``D``-prefix heuristic for this call but is NOT cached, so the next
+        reaction retries instead of mis-keying the conversation's sessions for
+        the whole process lifetime.
+        """
+        cached = self._reaction_channel_type.get(channel_id)
+        if cached is not None:
+            return cached
+
+        try:
+            resp = await self._get_client(channel_id).conversations_info(
+                channel=channel_id
+            )
+            if resp.get("ok", True):
+                chan = resp.get("channel") or {}
+                if chan.get("is_im"):
+                    resolved = "im"
+                elif chan.get("is_mpim"):
+                    resolved = "mpim"
+                else:
+                    resolved = "channel"
+                self._reaction_channel_type[channel_id] = resolved
+                return resolved
+            logger.debug(
+                "[Slack] conversations.info not ok for %s: %s",
+                channel_id,
+                resp.get("error"),
+            )
+        except Exception as exc:
+            logger.debug(
+                "[Slack] conversations.info failed for %s: %s", channel_id, exc
+            )
+        # Uncached heuristic fallback — retried on the next reaction.
+        return "im" if channel_id.startswith("D") else "channel"
+
+    async def _reactor_is_bot(self, user_id: str, channel_id: str = "") -> bool:
+        """Return whether a reacting user is another app/bot, cached.
+
+        Used so reactions from automations flow through the normal
+        ``allow_bots`` policy instead of silently summoning the agent. Our own
+        bot users are handled by the caller's self-reaction guard; a lookup
+        failure defaults to ``False`` (treat as human) to avoid dropping real
+        user summons.
+        """
+        if not user_id:
+            return False
+        cached = self._reactor_is_bot_cache.get(user_id)
+        if cached is not None:
+            return cached
+        is_bot = False
+        try:
+            client = self._get_client(channel_id) if channel_id else self._app.client
+            resp = await client.users_info(user=user_id)
+            if resp.get("ok", True):
+                user = resp.get("user") or {}
+                is_bot = bool(user.get("is_bot") or user.get("is_app_user"))
+        except Exception as exc:
+            logger.debug("[Slack] users.info (is_bot) failed for %s: %s", user_id, exc)
+        self._reactor_is_bot_cache[user_id] = is_bot
+        return is_bot
+
+    async def _fetch_slack_message_for_reaction(
+        self, channel_id: str, message_ts: str
+    ) -> Tuple[Optional[dict], str]:
+        """Fetch the message a reaction points at.
+
+        Returns ``(message, "")`` on success or ``(None, error_detail)`` when
+        the message cannot be read (missing scope, bot not in channel, …).
+
+        ``conversations.replies`` resolves both top-level messages and
+        in-thread replies when given a ts in the thread, but it returns the
+        thread parent FIRST — so a reacted reply is only present if we request
+        more than one message. We page the thread and scan for the exact ts.
+        ``conversations.history`` (top-level only) is the fallback.
+        """
+        client = self._get_client(channel_id)
+        last_error = ""
+
+        async def _scan(make_call) -> Optional[dict]:
+            # Lazily invoke the API — the fallback call must not be created
+            # (and left un-awaited) when the first lookup already resolved it.
+            nonlocal last_error
+            try:
+                resp = await make_call()
+                if resp.get("ok", True):
+                    for msg in resp.get("messages") or []:
+                        if msg.get("ts") == message_ts:
+                            return msg
+                else:
+                    last_error = str(resp.get("error") or "") or last_error
+            except Exception as exc:
+                last_error = str(exc) or last_error
+            return None
+
+        for make_call in (
+            lambda: client.conversations_replies(
+                # Page the thread (parent + replies) so a reacted reply — not
+                # just the thread root — is in the result to scan for.
+                channel=channel_id,
+                ts=message_ts,
+                limit=self._REACTION_FETCH_THREAD_LIMIT,
+                inclusive=True,
+            ),
+            lambda: client.conversations_history(
+                channel=channel_id, latest=message_ts, inclusive=True, limit=1
+            ),
+        ):
+            msg = await _scan(make_call)
+            if msg is not None:
+                return msg, ""
+
+        return None, last_error
+
+    def _reaction_lifecycle_ts(self, message_id: str) -> str:
+        """Resolve the message ts the lifecycle reaction should target.
+
+        For a reaction summon the event's message_id is a synthetic reaction
+        event_ts; redirect to the ORIGINAL reacted message so :eyes:/done land
+        on the message the user reacted to (see _reaction_lifecycle_target).
+        """
+        return getattr(self, "_reaction_lifecycle_target", {}).get(
+            message_id, message_id
+        )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -2053,26 +2780,37 @@ class SlackAdapter(BasePlatformAdapter):
             return
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes")
+            await self._add_reaction(
+                channel_id,
+                self._reaction_lifecycle_ts(ts),
+                self._slack_reaction_status_emojis()["in_progress"],
+            )
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        ts = getattr(event, "message_id", None)
+        # Always release the synthetic→real target for this turn (it's
+        # populated for every summon, regardless of the status toggle), so the
+        # map can't leak when status reactions are off.
+        react_ts = self._reaction_lifecycle_ts(ts) if ts else ts
+        if ts:
+            self._reaction_lifecycle_target.pop(ts, None)
         if not self._reactions_enabled():
             return
-        ts = getattr(event, "message_id", None)
         if not ts or ts not in self._reacting_message_ids:
             return
         self._reacting_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes")
+        emojis = self._slack_reaction_status_emojis()
+        await self._remove_reaction(channel_id, react_ts, emojis["in_progress"])
         if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark")
+            await self._add_reaction(channel_id, react_ts, emojis["done"])
         elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x")
+            await self._add_reaction(channel_id, react_ts, emojis["failed"])
 
     # ----- User identity resolution -----
 
@@ -2598,10 +3336,7 @@ class SlackAdapter(BasePlatformAdapter):
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
-            allow_bots = self.config.extra.get("allow_bots", "")
-            if not allow_bots:
-                allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
-            allow_bots = str(allow_bots).lower().strip()
+            allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
@@ -3210,6 +3945,14 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
+
+        # Remember the message the bot is actually engaging with, so an
+        # agent-initiated reaction with no explicit message_id targets it —
+        # not some unrelated message the bot ignored. Recorded HERE (after all
+        # mention/allowed-channel gating) rather than on arrival, and skipping
+        # synthetic reaction replays (whose ts is a reaction event_ts).
+        if channel_id and ts and not event.get("_reaction_synthetic"):
+            self._last_inbound_ts[channel_id] = ts
 
         msg_event = MessageEvent(
             text=text,
@@ -4020,19 +4763,7 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_id=thread_ts,
             )
 
-            # Read session isolation settings from the store's config
-            store_cfg = getattr(session_store, "config", None)
-            gspu = (
-                getattr(store_cfg, "group_sessions_per_user", True)
-                if store_cfg
-                else True
-            )
-            tspu = (
-                getattr(store_cfg, "thread_sessions_per_user", False)
-                if store_cfg
-                else False
-            )
-
+            gspu, tspu = self._session_isolation_settings()
             session_key = build_session_key(
                 source,
                 group_sessions_per_user=gspu,
@@ -4482,6 +5213,77 @@ def interactive_setup() -> None:
         save_env_value("SLACK_HOME_CHANNEL", home_channel.strip())
 
 
+def _parse_reaction_trigger_emojis(raw) -> set:
+    """Normalise a ``reaction_trigger_emojis`` config value into a name set.
+
+    Accepts a list of names or a CSV string (the env-var form). Emoji names
+    are lowercased with surrounding colons stripped, so ``:hermes:`` and
+    ``hermes`` are equivalent. Presence of any emoji is what enables the
+    feature — an empty/absent value keeps it off (consistent with
+    free_response_channels / allowed_channels).
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    emojis = set()
+    for entry in raw:
+        name = str(entry).strip().strip(":").lower()
+        if name:
+            emojis.add(name)
+    return emojis
+
+
+_DEFAULT_REACTION_STATUS_EMOJIS = {
+    "in_progress": "eyes",
+    "done": "white_check_mark",
+    "failed": "x",
+}
+
+
+def _parse_reaction_status_emojis(raw) -> dict:
+    """Normalise a ``reaction_status_emojis`` config value into a full emoji mapping.
+
+    Returns ``{in_progress, done, failed}`` merged over the defaults
+    (``eyes`` / ``white_check_mark`` / ``x``), so a partial override only
+    changes the slots it names. Accepts a mapping, a JSON object string, or a
+    positional CSV (``in_progress,done,failed``). Surrounding colons are
+    stripped so ``:eyes:`` and ``eyes`` are equivalent.
+    """
+    result = dict(_DEFAULT_REACTION_STATUS_EMOJIS)
+    if raw is None:
+        return result
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return result
+        parsed = None
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                parsed = None
+        if not isinstance(parsed, dict):
+            # Positional CSV: in_progress, done, failed.
+            parts = [p.strip() for p in s.split(",")]
+            parsed = {
+                key: parts[i]
+                for i, key in enumerate(("in_progress", "done", "failed"))
+                if i < len(parts) and parts[i]
+            }
+        raw = parsed
+    if isinstance(raw, dict):
+        for key in result:
+            val = raw.get(key)
+            if val is not None:
+                name = str(val).strip().strip(":")
+                if name:
+                    result[key] = name
+    return result
+
+
 def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     """Translate ``config.yaml`` ``slack:`` keys into ``SLACK_*`` env vars.
 
@@ -4511,6 +5313,16 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+    if "agent_reactions" in slack_cfg and not os.getenv("SLACK_AGENT_REACTIONS"):
+        os.environ["SLACK_AGENT_REACTIONS"] = str(slack_cfg["agent_reactions"]).lower()
+    rt = slack_cfg.get("reaction_trigger_emojis")
+    if rt is not None and not os.getenv("SLACK_REACTION_TRIGGER_EMOJIS"):
+        rt_emojis = _parse_reaction_trigger_emojis(rt)
+        if rt_emojis:
+            os.environ["SLACK_REACTION_TRIGGER_EMOJIS"] = ",".join(sorted(rt_emojis))
+    re_cfg = slack_cfg.get("reaction_status_emojis")
+    if re_cfg is not None and not os.getenv("SLACK_REACTION_STATUS_EMOJIS"):
+        os.environ["SLACK_REACTION_STATUS_EMOJIS"] = json.dumps(_parse_reaction_status_emojis(re_cfg))
     ac = slack_cfg.get("allowed_channels")
     if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
         if isinstance(ac, list):
@@ -4552,7 +5364,9 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, allowed_channels) into SLACK_*
+        # free_response_channels, reactions, agent_reactions,
+        # reaction_trigger_emojis, reaction_status_emojis, allowed_channels)
+        # into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,

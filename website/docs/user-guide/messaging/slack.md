@@ -81,6 +81,8 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | `users:read` | Look up user information |
 | `files:read` | Read and download attached files, including voice notes/audio |
 | `files:write` | Upload files (images, audio, documents) |
+| `reactions:read` | Receive emoji reactions ([reaction triggers](#reaction-triggers-emoji-summon)) |
+| `reactions:write` | Add `:eyes:`/`:white_check_mark:` lifecycle reactions to messages |
 
 :::caution Missing scopes = missing features
 Without `channels:history` and `groups:history`, the bot **will not receive messages in channels** —
@@ -130,6 +132,8 @@ This step is critical — it controls what messages the bot can see.
 | `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
 | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
 | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
+| `reaction_added` | Optional | Needed for [reaction triggers](#reaction-triggers-emoji-summon) (emoji summon) |
+| `reaction_removed` | Optional | Needed for remove-the-emoji-to-stop (part of [reaction triggers](#reaction-triggers-emoji-summon)) |
 
 4. Click **Save Changes** at the bottom of the page
 
@@ -417,6 +421,78 @@ Slack supports both patterns: `@mention` required to start a conversation by def
 
 :::caution Group DMs (MPIMs) are shared surfaces, not 1:1 DMs
 A **1:1 direct message** is a private conversation with one person, so it is mention-exempt. A **group DM (MPIM / multi-person DM)** is a *shared surface* — multiple people can see and trigger the bot — so it obeys the same operator controls as a channel: `require_mention`, `strict_mention`, `free_response_channels`, and `allowed_channels` all apply, and the bot only adds `:eyes:`/`:white_check_mark:` reactions when it is actually `@mentioned`. To let the bot respond freely in a specific group DM, add its channel ID (starts with `G`) to `free_response_channels`.
+:::
+
+### Reaction triggers (emoji summon)
+
+Opt-in: summon the bot onto any message by reacting to it with a configured emoji. The bot fetches the reacted message and responds **in that message's thread**, as if the reactor had @mentioned it there.
+
+```yaml
+slack:
+  reaction_trigger_emojis:      # emoji names without colons
+    - hermes
+    - eyes
+```
+
+Listing at least one emoji is what turns the feature on — there's no separate `enabled` flag (an empty or absent list leaves it off, like `free_response_channels` and `allowed_channels`). An inline list (`reaction_trigger_emojis: [hermes, eyes]`) works too.
+
+Environment-variable fallback (config.yaml takes precedence):
+
+```bash
+SLACK_REACTION_TRIGGER_EMOJIS=hermes,eyes
+```
+
+Behavior:
+
+- **Off by default.** With no configured emojis, `reaction_added` events are acknowledged and discarded (the pre-existing behavior).
+- **Replies in the thread** of the reacted message (or starts one if the message is top-level), keeping channel noise down.
+- **Shows progress on the reacted message.** When `slack.reactions` is on (the default), the bot adds its in-progress reaction (`:eyes:` by default) to the message you reacted to and swaps it for the done/failed reaction when it finishes — the same lifecycle a DM or @mention gets. See [Customizing the reaction emojis](#customizing-the-reaction-emojis) to change them.
+- **Once per message** — the first matching reaction summons the bot; other users piling onto the same emoji on the same message do not re-summon it. A different configured emoji on the same message counts as a new summon.
+- **Ignores the bot's own reactions**, so the `:eyes:`/`:white_check_mark:` lifecycle reactions can never self-summon.
+- **Skin-tone variants match** their base emoji (`thumbsup::skin-tone-2` matches `thumbsup`).
+- The reactor is treated as the requesting user, so the normal user allowlist (`SLACK_ALLOWED_USERS`) still applies, `allowed_channels` still filters which channels the bot will engage in, and reactions from **other apps/bots** are subject to your `allow_bots` policy (they do not bypass it).
+- If the bot **cannot read the message** (not in the channel, missing scope), it replies in-thread with a short "I don't have access" note. The summon is *not* consumed, so after you invite the bot, re-adding the same emoji works.
+- **Remove the emoji to stop.** Removing a trigger emoji from a message whose turn is still running is treated as `/stop` for that thread — a quick way to cancel a summon you didn't mean. This also clears the once-per-message guard, so re-adding the emoji can summon again. (Requires the `reaction_removed` event. It's part of the summon feature, gated only on your `reaction_trigger_emojis` — independent of the `slack.reactions` status-marker toggle.)
+
+:::caution App reinstall required
+Reaction triggers need the `reactions:read` bot scope and the `reaction_added` event subscription (plus `reaction_removed` for the remove-to-stop behavior). Regenerate the manifest with `hermes slack manifest` (all included by default), update your app at [api.slack.com/apps](https://api.slack.com/apps), and **reinstall it to your workspace** for the new scope to take effect.
+:::
+
+### Customizing the reaction emojis
+
+The bot marks progress on messages it's working on — in-progress while running, then success or failure — for 1:1 DMs, @mentions, and reaction summons. This is on by default and toggled with `slack.reactions` (or `SLACK_REACTIONS=false`).
+
+The three emojis default to `:eyes:` / `:white_check_mark:` / `:x:` and are configurable (names without colons; custom workspace emoji are fine):
+
+```yaml
+slack:
+  reaction_status_emojis:
+    in_progress: hourglass_flowing_sand
+    done: white_check_mark
+    failed: warning
+```
+
+Any slot you omit keeps its default. An environment fallback is also accepted — either JSON (`SLACK_REACTION_STATUS_EMOJIS='{"in_progress":"hourglass_flowing_sand"}'`) or positional CSV in `in_progress,done,failed` order (`SLACK_REACTION_STATUS_EMOJIS=hourglass_flowing_sand,white_check_mark,warning`). No app reinstall is needed — this is a send-side change (the `reactions:write` scope is already in the manifest).
+
+### Agent reactions (`agent_reactions`)
+
+Opt-in: let the assistant **choose to react with an emoji** as a response, rather than always sending a text reply. This makes it feel more present in a channel — acknowledging a message with a 👍, accepting praise with a 🙏, or reacting on request — without adding a message every time.
+
+```yaml
+slack:
+  agent_reactions: true      # default false
+```
+
+This is **independent of `reactions`** above. `reactions` governs the *automatic* in-progress/done status markers; `agent_reactions` governs *deliberate* reactions the model sends as communication. You can run with `reactions: false` (no status noise) and `agent_reactions: true` (the assistant can still react on purpose), or any other combination.
+
+How it behaves:
+- The assistant reacts to the message it's replying to, as an expressive layer *on top of* its normal reply — it still answers/engages when the message calls for it; the reaction doesn't replace the response.
+- It only reacts in conversations it's actually engaged in (a 1:1 DM, or a channel thread where it's been mentioned / is active) — it can't react to messages it wouldn't otherwise see.
+- Reactions are subject to the normal `reactions:write` scope (already in the generated manifest).
+- How eagerly and how *characterfully* it reacts is shaped by its prompt/persona — the config only grants the capability. See the note below.
+
+:::note Steering how it reacts
+Turning `agent_reactions: true` on gives the assistant the *ability* to react; how it uses that is guided by its system prompt and persona. Hermes injects a built-in reaction-guidance block whenever the capability is available — it encourages apt, characterful reactions and stops the assistant from *narrating* a reaction ("Reacted with 🎉"), while leaving normal replies to flow. Per-assistant tone (how playful, when to react) can be tuned further in that assistant's persona.
 :::
 
 ### Channel allowlist (`allowed_channels`)

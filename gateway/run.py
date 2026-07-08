@@ -16784,6 +16784,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        # The `react` tool is exposed only where it actually works and is
+        # opted in — currently Slack with slack.agent_reactions on. Other
+        # adapters lack the agent-facing add_reaction contract, so we don't
+        # pay its schema/prompt cost or invite unsupported calls there.
+        # Extend this gate when another platform gains the capability.
+        try:
+            _react_adapter = self.adapters.get(source.platform)
+            if (
+                platform_key == "slack"
+                and _react_adapter is not None
+                and getattr(_react_adapter, "_agent_reactions_enabled", lambda: False)()
+                and "react" not in enabled_toolsets
+            ):
+                enabled_toolsets = sorted(set(enabled_toolsets) | {"react"})
+        except Exception:
+            logger.debug("react toolset gating check failed", exc_info=True)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -18255,6 +18271,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return response
 
             agent.clarify_callback = _clarify_callback_sync
+
+            # ------------------------------------------------------------------
+            # React callback: let the agent add/remove an emoji reaction on the
+            # message it's replying to (opt-in via the adapter). Sync→async
+            # bridge like clarify; returns the adapter's result dict. Adapters
+            # without add_reaction/remove_reaction (or with the capability
+            # disabled) report that back so the agent can adapt.
+            # ------------------------------------------------------------------
+            def _react_callback_sync(emoji: str, message_id=None, remove: bool = False):
+                if not _status_adapter:
+                    return {"success": False, "error": "No active chat to react in."}
+                fn = getattr(
+                    _status_adapter,
+                    "remove_reaction" if remove else "add_reaction",
+                    None,
+                )
+                if not callable(fn):
+                    return {
+                        "success": False,
+                        "error": "This platform does not support reactions.",
+                    }
+                # Default to THIS turn's triggering message so "the message
+                # you're replying to" is literally true, rather than relying on
+                # the adapter's channel-global last-inbound fallback (which can
+                # race across concurrent addressed threads in one channel).
+                target_message_id = message_id or event_message_id
+                if remove:
+                    # Forward the emoji so the model can retract a specific
+                    # reaction; adapters treat emoji=None as "remove my own".
+                    coro = fn(
+                        chat_id=_status_chat_id,
+                        message_id=target_message_id,
+                        emoji=(emoji or None),
+                    )
+                else:
+                    coro = fn(
+                        chat_id=_status_chat_id,
+                        emoji=emoji,
+                        message_id=target_message_id,
+                    )
+                fut = safe_schedule_threadsafe(
+                    coro,
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="Reaction failed to schedule",
+                )
+                if fut is None:
+                    return {"success": False, "error": "Could not schedule reaction."}
+                try:
+                    result = fut.result(timeout=15)
+                except Exception as exc:
+                    logger.warning("Reaction failed: %s", exc)
+                    return {"success": False, "error": str(exc)}
+                return result if isinstance(result, dict) else {"success": bool(result)}
+
+            agent.react_callback = _react_callback_sync
 
             # Show assistant thinking between tool calls — independent of
             # tool_progress mode. Mattermost needs an explicit per-platform
