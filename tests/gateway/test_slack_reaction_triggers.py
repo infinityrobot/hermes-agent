@@ -66,6 +66,7 @@ from plugins.platforms.slack.adapter import (  # noqa: E402
 BOT_USER_ID = "U_BOT_123"
 REACTOR_ID = "U_HUMAN_456"
 AUTHOR_ID = "U_AUTHOR_789"
+TEAM_ID = "T_WORKSPACE_1"
 CHANNEL_ID = "C0AQWDLHY9M"
 MSG_TS = "1751600000.000100"
 EVENT_TS = "1751600100.000200"
@@ -761,7 +762,7 @@ class TestReactionSummonLifecycle:
 
         return SimpleNamespace(
             message_id=EVENT_TS,
-            source=SimpleNamespace(chat_id=CHANNEL_ID),
+            source=SimpleNamespace(chat_id=CHANNEL_ID, scope_id=TEAM_ID),
         )
 
     @pytest.mark.asyncio
@@ -775,7 +776,9 @@ class TestReactionSummonLifecycle:
         await adapter.on_processing_start(self._event())
 
         # Reaction lands on the original message ts, not the synthetic event ts.
-        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "eyes", TEAM_ID
+        )
 
     @pytest.mark.asyncio
     async def test_on_complete_swaps_on_original_and_clears_map(self, monkeypatch):
@@ -788,9 +791,11 @@ class TestReactionSummonLifecycle:
 
         await adapter.on_processing_complete(self._event(), ProcessingOutcome.SUCCESS)
 
-        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+        adapter._remove_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "eyes", TEAM_ID
+        )
         adapter._add_reaction.assert_awaited_once_with(
-            CHANNEL_ID, MSG_TS, "white_check_mark"
+            CHANNEL_ID, MSG_TS, "white_check_mark", TEAM_ID
         )
         assert EVENT_TS not in adapter._reaction_lifecycle_target
 
@@ -806,11 +811,17 @@ class TestReactionSummonLifecycle:
         ev = self._event()
         ev.message_id = MSG_TS
         await adapter.on_processing_start(ev)
-        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "hourglass")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "hourglass", TEAM_ID
+        )
 
         await adapter.on_processing_complete(ev, ProcessingOutcome.FAILURE)
-        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "hourglass")
-        adapter._add_reaction.assert_awaited_with(CHANNEL_ID, MSG_TS, "boom")
+        adapter._remove_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "hourglass", TEAM_ID
+        )
+        adapter._add_reaction.assert_awaited_with(
+            CHANNEL_ID, MSG_TS, "boom", TEAM_ID
+        )
 
 
 class TestAgentReactions:
