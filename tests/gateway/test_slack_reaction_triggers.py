@@ -182,6 +182,48 @@ def _reaction_removed_event(**kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Merged reaction routing
+# ---------------------------------------------------------------------------
+
+class TestMergedReactionRouting:
+    @pytest.mark.asyncio
+    async def test_summon_takes_precedence_but_gateway_hook_still_fires(self):
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
+        adapter.config.extra["reaction_triggers"] = ["hermes"]
+        reaction_hook = AsyncMock()
+        summon_handler = AsyncMock()
+        handle_message = AsyncMock()
+        adapter._reaction_handler = reaction_hook
+        adapter._handle_slack_reaction_added = summon_handler
+        adapter._handle_slack_message = handle_message
+
+        event = _reaction_event()
+        body = {"team_id": TEAM_ID}
+        await adapter._dispatch_slack_reaction_event(event, body)
+
+        reaction_hook.assert_awaited_once()
+        summon_handler.assert_awaited_once_with(event, body)
+        # The compact reaction_triggers path is suppressed, so the shared
+        # Slack event creates exactly one agent turn.
+        handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_summon_emoji_uses_generic_reaction_route(self):
+        adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
+        adapter.config.extra["reaction_triggers"] = ["tada"]
+        handle_message = AsyncMock()
+        adapter._handle_slack_message = handle_message
+
+        await adapter._dispatch_slack_reaction_event(
+            _reaction_event(reaction="tada"), {"team_id": TEAM_ID}
+        )
+
+        handle_message.assert_awaited_once()
+        synthetic = handle_message.await_args_list[0].args[0]
+        assert synthetic["text"] == "reaction:added:🎉"
+
+
+# ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
 
@@ -770,7 +812,9 @@ class TestReactionSummonLifecycle:
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
         adapter, _ = _make_adapter()
         adapter._add_reaction = AsyncMock(return_value=True)
-        adapter._reacting_message_ids = {EVENT_TS}
+        adapter._reacting_message_ids = {
+            adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        }
         adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
 
         await adapter.on_processing_start(self._event())
@@ -786,7 +830,9 @@ class TestReactionSummonLifecycle:
         adapter, _ = _make_adapter()
         adapter._add_reaction = AsyncMock(return_value=True)
         adapter._remove_reaction = AsyncMock(return_value=True)
-        adapter._reacting_message_ids = {EVENT_TS}
+        adapter._reacting_message_ids = {
+            adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        }
         adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
 
         await adapter.on_processing_complete(self._event(), ProcessingOutcome.SUCCESS)
@@ -806,7 +852,9 @@ class TestReactionSummonLifecycle:
         adapter, _ = _make_adapter()
         adapter._add_reaction = AsyncMock(return_value=True)
         adapter._remove_reaction = AsyncMock(return_value=True)
-        adapter._reacting_message_ids = {MSG_TS}  # normal message, no redirect
+        adapter._reacting_message_ids = {
+            adapter._workspace_message_marker(TEAM_ID, MSG_TS)
+        }  # normal message, no redirect
 
         ev = self._event()
         ev.message_id = MSG_TS

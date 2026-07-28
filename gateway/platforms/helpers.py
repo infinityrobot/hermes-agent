@@ -70,13 +70,20 @@ class MessageDeduplicator:
                 self._seen = dict(newest)
         return False
 
-    def discard(self, msg_id: str) -> None:
-        """Forget *msg_id* so its next occurrence is treated as new.
+    def contains(self, msg_id: str) -> bool:
+        """Return whether *msg_id* is live in the cache without inserting it."""
+        if not msg_id:
+            return False
+        seen_at = self._seen.get(msg_id)
+        if seen_at is None:
+            return False
+        if time.time() - seen_at < self._ttl:
+            return True
+        del self._seen[msg_id]
+        return False
 
-        Use when a recorded id turns out not to have been handled after all
-        (e.g. a fetch failed and the caller wants a later retry to go
-        through), so ``is_duplicate`` does not permanently suppress it.
-        """
+    def discard(self, msg_id: str) -> None:
+        """Release a claimed message ID after cancelled/failed handoff."""
         self._seen.pop(msg_id, None)
 
     def clear(self):
