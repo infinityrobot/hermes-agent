@@ -22418,20 +22418,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the adapter's channel-global last-inbound fallback (which can
                 # race across concurrent addressed threads in one channel).
                 target_message_id = message_id or event_message_id
+                reaction_kwargs = {
+                    "chat_id": _status_chat_id,
+                    "message_id": target_message_id,
+                }
+                if source.platform == Platform.SLACK:
+                    reaction_kwargs["team_id"] = str(
+                        getattr(source, "scope_id", "") or ""
+                    )
                 if remove:
                     # Forward the emoji so the model can retract a specific
                     # reaction; adapters treat emoji=None as "remove my own".
-                    coro = fn(
-                        chat_id=_status_chat_id,
-                        message_id=target_message_id,
-                        emoji=(emoji or None),
-                    )
+                    reaction_kwargs["emoji"] = emoji or None
                 else:
-                    coro = fn(
-                        chat_id=_status_chat_id,
-                        emoji=emoji,
-                        message_id=target_message_id,
-                    )
+                    reaction_kwargs["emoji"] = emoji
+                coro = fn(**reaction_kwargs)
                 fut = safe_schedule_threadsafe(
                     coro,
                     _loop_for_step,
