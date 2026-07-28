@@ -3839,6 +3839,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
+        ("react", {"emoji": "eyes"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -3875,6 +3876,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.read_terminal_tool.read_terminal_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.react_tool.react_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
