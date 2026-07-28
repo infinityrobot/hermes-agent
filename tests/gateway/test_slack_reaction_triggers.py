@@ -9,6 +9,7 @@ reacted message. Follows the mock/setup pattern of test_slack_mention.py.
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -86,10 +87,15 @@ def _make_adapter(reaction_trigger_emojis=None, agent_reactions=None):
     adapter._team_bot_user_ids = {}
     adapter._team_clients = {}
     adapter._channel_team = {}
+    adapter._channel_teams = {}
+    adapter._CHANNEL_TEAM_MAX = 10000
+    adapter._user_is_bot_cache = {}
+    adapter._user_name_cache = {}
+    adapter._USER_NAME_CACHE_MAX = 5000
     adapter._reaction_summon_dedup = MessageDeduplicator(max_size=5000)
     adapter._reaction_channel_type = {}
-    adapter._reactor_is_bot_cache = {}
     adapter._reaction_lifecycle_target = {}
+    adapter._REACTION_LIFECYCLE_TARGET_MAX = 5000
     adapter._reacting_message_ids = set()
     adapter._last_inbound_ts = {}
     adapter._active_sessions = {}
@@ -134,6 +140,7 @@ def _mark_active_thread(
     thread_ts=MSG_TS,
     user=REACTOR_ID,
     channel_type="channel",
+    team_id=TEAM_ID,
 ):
     from gateway.session import build_session_key
 
@@ -143,6 +150,7 @@ def _mark_active_thread(
         chat_type="dm" if channel_type in {"im", "mpim"} else "group",
         user_id=user,
         thread_id=thread_ts,
+        scope_id=team_id or None,
     )
     key = build_session_key(
         source,
@@ -163,6 +171,7 @@ def _reaction_event(
     channel=CHANNEL_ID,
     ts=MSG_TS,
     item_type="message",
+    team=TEAM_ID,
 ):
     return {
         "type": "reaction_added",
@@ -171,6 +180,7 @@ def _reaction_event(
         "item": {"type": item_type, "channel": channel, "ts": ts},
         "item_user": AUTHOR_ID,
         "event_ts": EVENT_TS,
+        "team": team,
     }
 
 
@@ -564,7 +574,7 @@ class TestHandleSlackReactionAdded:
         # The inner reaction event has no team; the outer Bolt body carries it.
         adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(
-            _reaction_event(), body={"team_id": "T_OUTER"}
+            _reaction_event(team=""), body={"team_id": "T_OUTER"}
         )
         synthetic = adapter._handle_slack_message.await_args.args[0]
         assert synthetic["team"] == "T_OUTER"
@@ -638,7 +648,7 @@ class TestHandleSlackReactionAdded:
         }
         second = await adapter._resolve_reaction_channel_type("G12345678")
         assert second == "mpim"
-        assert adapter._reaction_channel_type["G12345678"] == "mpim"
+        assert adapter._reaction_channel_type[("", "G12345678")] == "mpim"
 
 
 class TestHandleSlackReactionRemoved:
@@ -687,7 +697,7 @@ class TestHandleSlackReactionRemoved:
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
         adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         _mark_active_thread(adapter)
-        summon_key = f":{CHANNEL_ID}:{MSG_TS}:hermes"
+        summon_key = f"{TEAM_ID}:{CHANNEL_ID}:{MSG_TS}:hermes"
         adapter._reaction_summon_dedup.is_duplicate(summon_key)  # record it
 
         await adapter._handle_slack_reaction_removed(_reaction_removed_event())
@@ -776,7 +786,7 @@ class TestHandleSlackReactionRemoved:
         monkeypatch.delenv("SLACK_REACTIONS", raising=False)
         adapter, client = _make_adapter(reaction_trigger_emojis=["hermes"])
         adapter._team_bot_user_ids = {"T1": ""}
-        _mark_active_thread(adapter, thread_ts=MSG_TS)
+        _mark_active_thread(adapter, thread_ts=MSG_TS, team_id="T1")
 
         event = _reaction_removed_event()
         event["team"] = "T1"
@@ -797,7 +807,9 @@ class TestReactionSummonLifecycle:
         adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
         # synthetic ts (EVENT_TS) redirects to the reacted message (MSG_TS).
-        assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS
+        assert adapter._reaction_lifecycle_target.get(
+            adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        ) == MSG_TS
 
     def _event(self):
         from types import SimpleNamespace
@@ -815,7 +827,8 @@ class TestReactionSummonLifecycle:
         adapter._reacting_message_ids = {
             adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
         }
-        adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
+        lifecycle_marker = adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        adapter._reaction_lifecycle_target = {lifecycle_marker: MSG_TS}
 
         await adapter.on_processing_start(self._event())
 
@@ -833,7 +846,8 @@ class TestReactionSummonLifecycle:
         adapter._reacting_message_ids = {
             adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
         }
-        adapter._reaction_lifecycle_target = {EVENT_TS: MSG_TS}
+        lifecycle_marker = adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        adapter._reaction_lifecycle_target = {lifecycle_marker: MSG_TS}
 
         await adapter.on_processing_complete(self._event(), ProcessingOutcome.SUCCESS)
 
@@ -843,7 +857,7 @@ class TestReactionSummonLifecycle:
         adapter._add_reaction.assert_awaited_once_with(
             CHANNEL_ID, MSG_TS, "white_check_mark", TEAM_ID
         )
-        assert EVENT_TS not in adapter._reaction_lifecycle_target
+        assert lifecycle_marker not in adapter._reaction_lifecycle_target
 
     @pytest.mark.asyncio
     async def test_configured_emojis_used(self, monkeypatch):
@@ -892,16 +906,20 @@ class TestAgentReactions:
         result = await adapter.add_reaction(CHANNEL_ID, ":tada:", message_id=MSG_TS)
         assert result["success"] is True
         # colon-stripped emoji, correct target
-        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "tada", ""
+        )
 
     @pytest.mark.asyncio
     async def test_defaults_to_last_inbound_message(self):
         adapter, _ = _make_adapter(agent_reactions=True)
         adapter._add_reaction = AsyncMock(return_value=True)
-        adapter._last_inbound_ts[CHANNEL_ID] = MSG_TS
+        adapter._last_inbound_ts[("", CHANNEL_ID)] = MSG_TS
         result = await adapter.add_reaction(CHANNEL_ID, "eyes")
         assert result["success"] is True
-        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "eyes", ""
+        )
 
     @pytest.mark.asyncio
     async def test_no_target_message_errors(self):
@@ -925,7 +943,9 @@ class TestAgentReactions:
         adapter._remove_reaction = AsyncMock(return_value=True)
         result = await adapter.remove_reaction(CHANNEL_ID, message_id=MSG_TS, emoji="tada")
         assert result["success"] is True
-        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+        adapter._remove_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "tada", ""
+        )
 
     @pytest.mark.asyncio
     async def test_remove_without_emoji_removes_bots_own(self, monkeypatch):
@@ -945,7 +965,143 @@ class TestAgentReactions:
         result = await adapter.remove_reaction(CHANNEL_ID, message_id=MSG_TS)
         assert result["success"] is True
         # Only the bot's own reaction (eyes) is removed, not someone else's tada.
-        adapter._remove_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "eyes")
+        adapter._remove_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "eyes", ""
+        )
+
+
+class TestMultiWorkspaceReactionScoping:
+    @staticmethod
+    def _workspace_client(*, bot_user=BOT_USER_ID):
+        client = MagicMock()
+        client.users_info = AsyncMock(
+            return_value={"ok": True, "user": {"is_bot": False}}
+        )
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_im": False}}
+        )
+        client.conversations_replies = AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [
+                    {
+                        "ts": MSG_TS,
+                        "text": "workspace message",
+                        "user": bot_user,
+                    }
+                ],
+            }
+        )
+        client.conversations_history = AsyncMock(
+            return_value={"ok": True, "messages": []}
+        )
+        client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        return client
+
+    @pytest.mark.asyncio
+    async def test_summon_uses_outer_body_workspace_client(self):
+        adapter, primary = _make_adapter(reaction_trigger_emojis=["hermes"])
+        workspace_client = self._workspace_client()
+        adapter._team_clients["T_TWO"] = workspace_client
+
+        await adapter._handle_slack_reaction_added(
+            _reaction_event(team=""), body={"team_id": "T_TWO"}
+        )
+
+        workspace_client.conversations_replies.assert_awaited_once()
+        primary.conversations_replies.assert_not_awaited()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["team"] == "T_TWO"
+        marker = adapter._workspace_message_marker("T_TWO", EVENT_TS)
+        assert adapter._reaction_lifecycle_target[marker] == MSG_TS
+
+    @pytest.mark.asyncio
+    async def test_generic_route_uses_event_workspace_for_shared_channel_id(self):
+        adapter, primary = _make_adapter()
+        adapter.config.extra["reaction_triggers"] = ["tada"]
+        workspace_client = self._workspace_client(bot_user="U_BOT_TWO")
+        adapter._team_clients["T_TWO"] = workspace_client
+        adapter._team_bot_user_ids["T_TWO"] = "U_BOT_TWO"
+        adapter._remember_channel_team(CHANNEL_ID, "T_ONE")
+
+        event = _reaction_event(reaction="tada", team="")
+        event["item_user"] = "U_BOT_TWO"
+        await adapter._dispatch_slack_reaction_event(
+            event, {"team_id": "T_TWO"}
+        )
+
+        workspace_client.conversations_replies.assert_awaited_once()
+        primary.conversations_replies.assert_not_awaited()
+        synthetic = adapter._handle_slack_message.await_args.args[0]
+        assert synthetic["team"] == "T_TWO"
+        assert adapter._channel_teams[CHANNEL_ID] == {"T_ONE", "T_TWO"}
+        assert CHANNEL_ID not in adapter._channel_team
+
+    @pytest.mark.asyncio
+    async def test_agent_reaction_fails_closed_without_ambiguous_workspace(self):
+        adapter, _ = _make_adapter(agent_reactions=True)
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._channel_teams[CHANNEL_ID] = {"T_ONE", "T_TWO"}
+
+        ambiguous = await adapter.add_reaction(
+            CHANNEL_ID, "eyes", message_id=MSG_TS
+        )
+        assert ambiguous["success"] is False
+        assert "Ambiguous" in ambiguous["error"]
+        adapter._add_reaction.assert_not_awaited()
+
+        scoped = await adapter.add_reaction(
+            CHANNEL_ID, "eyes", message_id=MSG_TS, team_id="T_TWO"
+        )
+        assert scoped["success"] is True
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "eyes", "T_TWO"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_workspace_scope_fails_closed_with_multiple_clients(self):
+        adapter, primary = _make_adapter(reaction_trigger_emojis=["hermes"])
+        adapter.config.extra["reaction_triggers"] = ["hermes"]
+        adapter._team_clients = {
+            "T_ONE": self._workspace_client(),
+            "T_TWO": self._workspace_client(),
+        }
+
+        await adapter._dispatch_slack_reaction_event(
+            _reaction_event(team=""), body={}
+        )
+
+        adapter._handle_slack_message.assert_not_awaited()
+        primary.conversations_replies.assert_not_awaited()
+        for client in adapter._team_clients.values():
+            client.conversations_replies.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_targets_are_isolated_by_workspace(self):
+        adapter, _ = _make_adapter()
+        adapter._add_reaction = AsyncMock(return_value=True)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        team_one_marker = adapter._workspace_message_marker("T_ONE", EVENT_TS)
+        team_two_marker = adapter._workspace_message_marker("T_TWO", EVENT_TS)
+        adapter._reaction_lifecycle_target = {
+            team_one_marker: "111.0001",
+            team_two_marker: "222.0002",
+        }
+        adapter._reacting_message_ids = {team_one_marker, team_two_marker}
+        event = SimpleNamespace(
+            message_id=EVENT_TS,
+            source=SimpleNamespace(chat_id=CHANNEL_ID, scope_id="T_TWO"),
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        adapter._remove_reaction.assert_awaited_once_with(
+            CHANNEL_ID, "222.0002", "eyes", "T_TWO"
+        )
+        assert team_one_marker in adapter._reaction_lifecycle_target
+        assert team_two_marker not in adapter._reaction_lifecycle_target
+        assert team_one_marker in adapter._reacting_message_ids
+        assert team_two_marker not in adapter._reacting_message_ids
 
 
 class TestReactionsToggle:
@@ -989,10 +1145,13 @@ class TestReactionCodexFixes:
         # add_reaction must resolve it back to the real reacted message.
         adapter, _ = _make_adapter(agent_reactions=True)
         adapter._add_reaction = AsyncMock(return_value=True)
-        adapter._reaction_lifecycle_target[EVENT_TS] = MSG_TS  # synthetic → real
+        marker = adapter._workspace_message_marker("", EVENT_TS)
+        adapter._reaction_lifecycle_target[marker] = MSG_TS  # synthetic → real
         result = await adapter.add_reaction(CHANNEL_ID, "tada", message_id=EVENT_TS)
         assert result["success"] is True
-        adapter._add_reaction.assert_awaited_once_with(CHANNEL_ID, MSG_TS, "tada")
+        adapter._add_reaction.assert_awaited_once_with(
+            CHANNEL_ID, MSG_TS, "tada", ""
+        )
 
     @pytest.mark.asyncio
     async def test_unauthorized_reactor_does_not_consume_summon_slot(self):
@@ -1015,4 +1174,6 @@ class TestReactionCodexFixes:
         monkeypatch.setenv("SLACK_REACTIONS", "false")
         adapter, _ = _make_adapter(reaction_trigger_emojis=["hermes"])
         await adapter._handle_slack_reaction_added(_reaction_event())
-        assert adapter._reaction_lifecycle_target.get(EVENT_TS) == MSG_TS
+        assert adapter._reaction_lifecycle_target.get(
+            adapter._workspace_message_marker(TEAM_ID, EVENT_TS)
+        ) == MSG_TS
