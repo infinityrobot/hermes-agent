@@ -6,6 +6,8 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 import asyncio
 import concurrent.futures
 import json
+import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -1518,7 +1520,14 @@ class TestToolsetInjection:
             broken_fixed = True
             call_count = 0
 
-            # Second call: should retry broken, skip good
+            # The failed server is now serving a post-failure backoff
+            # (#50394: prevents a tight re-spawn storm across the frequent
+            # per-worker-session discovery passes). Expire that cooldown to
+            # simulate the retry window having elapsed.
+            import tools.mcp_tool as _mcp_mod
+            _mcp_mod._server_connect_retry_after.pop("broken", None)
+
+            # Next call after the cooldown: should retry broken, skip good
             result2 = discover_mcp_tools()
             assert "mcp__good__ping" in result2
             assert "mcp__broken__ping" in result2
@@ -1755,6 +1764,41 @@ class TestBuildSafeEnv:
         assert "OPENAI_API_KEY" not in result
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
+
+    def test_secret_source_injected_vars_are_passed(self, monkeypatch):
+        """Vars tagged by an external secret source (Bitwarden/1Password) are
+        deliberately allowed for MCP stdio servers."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        fake_env = {
+            "PATH": "/usr/bin",
+            "ALPACA_API_KEY": "from-bws-key",
+            "NOTION_TOKEN": "from-op",
+            "UNTRACKED_SECRET_KEY": "still-filtered",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env(None)
+
+        assert result["PATH"] == "/usr/bin"
+        assert result["ALPACA_API_KEY"] == "from-bws-key"
+        assert result["NOTION_TOKEN"] == "from-op"
+        assert "UNTRACKED_SECRET_KEY" not in result
+
+    def test_user_env_overrides_secret_source_var(self, monkeypatch):
+        """Explicit MCP server env config remains the highest-precedence source."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
+        with patch.dict(
+            "os.environ", {"PATH": "/usr/bin", "ALPACA_API_KEY": "from-bws"}, clear=True
+        ):
+            result = _build_safe_env({"ALPACA_API_KEY": "from-config"})
+
+        assert result["ALPACA_API_KEY"] == "from-config"
 
     def test_windows_location_vars_passed_without_secrets(self):
         """Windows launcher tools need location vars, but secrets stay filtered."""
@@ -3832,6 +3876,52 @@ class TestMCPSelectiveToolLoading:
             "mcp__ink_exclude__list_services",
         ]
 
+    def test_exclude_filter_supports_globs(self):
+        """fnmatch globs in exclude — the Cloudflare flat-mode shape
+        (``*_radar_*`` etc.). Previously silently matched nothing."""
+        config = {
+            "url": "https://mcp.example.com",
+            "tools": {"exclude": ["*_radar_*", "delete_*"]},
+        }
+        registered, _ = self._run_discover(
+            "ink_glob",
+            ["get_radar_summary", "get_accounts_radar_http", "delete_service",
+             "create_service", "list_services"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == [
+            "mcp__ink_glob__create_service",
+            "mcp__ink_glob__list_services",
+        ]
+
+    def test_include_filter_supports_globs(self):
+        """Globs work symmetrically on the include whitelist."""
+        config = {
+            "url": "https://mcp.example.com",
+            "tools": {"include": ["get_zones_*"]},
+        }
+        registered, _ = self._run_discover(
+            "ink_glob_inc",
+            ["get_zones_dns_records", "get_zones_settings", "delete_zone",
+             "get_accounts"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == [
+            "mcp__ink_glob_inc__get_zones_dns_records",
+            "mcp__ink_glob_inc__get_zones_settings",
+        ]
+
+    def test_exact_names_still_match_exactly(self):
+        """No-metachar entries stay literal — 'docs' must not glob-match
+        'docs_search', and exact matching is unchanged."""
+        from tools.mcp_tool import matches_name_filter
+        assert matches_name_filter("docs", {"docs"})
+        assert not matches_name_filter("docs_search", {"docs"})
+        assert matches_name_filter("docs_search", {"docs*"})
+        assert not matches_name_filter("anything", set())
+
     def test_include_filter_skips_utility_tools_without_capabilities(self):
         config = {
             "url": "https://mcp.example.com",
@@ -4520,3 +4610,302 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+# ---------------------------------------------------------------------------
+# Cross-process MCP discovery lock (issue #62771)
+# ---------------------------------------------------------------------------
+
+
+class TestMCPDiscoveryCrossProcessLock:
+    """Tests for the cross-process MCP discovery guard in discover_mcp_tools()."""
+
+    @staticmethod
+    def _lock_exclusive(fh):
+        """Lock a file handle exclusively, cross-platform.
+
+        Mirrors production _try_acquire_mcp_discovery_lock: fcntl on POSIX,
+        portalocker on Windows (portalocker only ships on win32 installs).
+        """
+        if sys.platform == "win32":
+            import portalocker
+
+            self._lock_exclusive(fh)
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @pytest.fixture(autouse=True)
+    def _fast_retries(self):
+        """Override retry constants so tests are fast."""
+        import tools.mcp_tool as mcp_tool
+        orig_max = mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES
+        orig_delay = mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S
+        mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = 3
+        mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = 0.01
+        yield
+        mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = orig_max
+        mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = orig_delay
+
+    def test_lock_acquired_path(self, tmp_path):
+        """Lock acquired -> discovery runs normally, lock released at end."""
+        from tools.mcp_tool import (
+            _LockCookie,
+            discover_mcp_tools,
+        )
+
+        lock_file = tmp_path / ".mcp-discovery.lock"
+        fh = open(lock_file, "w", encoding="utf-8")
+        cookie = _LockCookie(fh)
+
+        def mock_acquire():
+            return cookie
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        with patch.object(cookie, "release", wraps=cookie.release) as release_spy:
+            with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", mock_acquire), \
+                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+                 patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp__test_srv__ping"]) as reg_spy:
+                result = discover_mcp_tools()
+            assert result == ["mcp__test_srv__ping"]
+            release_spy.assert_called_once()
+
+    def test_lock_held_retries_then_acquires(self):
+        """First attempt sees lock held; retry succeeds; then discovery runs."""
+        from tools.mcp_tool import (
+            _LOCK_UNAVAILABLE,
+            discover_mcp_tools,
+        )
+
+        import tempfile
+        from tools.mcp_tool import _LockCookie
+
+        lock_path = [None]
+        call_count = [0]
+
+        def mock_acquire():
+            call_count[0] += 1
+            if call_count[0] <= 1:
+                return None   # first call: lock held
+            # build a real cookie so release() works
+            tf = tempfile.NamedTemporaryFile(
+                prefix="mcp-lock-", suffix=".tmp", delete=False
+            )
+            lock_path[0] = tf.name
+            self._lock_exclusive(tf)
+            return _LockCookie(tf)
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        try:
+            with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", mock_acquire), \
+                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+                 patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp__test_srv__ping"]) as reg_spy:
+                result = discover_mcp_tools()
+            assert result == ["mcp__test_srv__ping"]
+            # register_mcp_servers must be called (local discovery ran)
+            reg_spy.assert_called_once_with(mock_config)
+        finally:
+            if lock_path[0]:
+                try:
+                    os.unlink(lock_path[0])
+                except Exception:
+                    pass
+
+    def test_lock_held_retries_exhausted_fallback(self):
+        """All retry attempts see lock held -> runs discovery unguarded."""
+        from tools.mcp_tool import (
+            _LOCK_UNAVAILABLE,
+            discover_mcp_tools,
+            _MCP_DISCOVERY_LOCK_MAX_RETRIES,
+        )
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        # Every attempt returns None (lock held)
+        with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", return_value=None), \
+             patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+             patch("tools.mcp_tool.register_mcp_servers") as reg_spy, \
+             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+            result = discover_mcp_tools()
+        # Must still run local discovery
+        reg_spy.assert_called_once_with(mock_config)
+
+    def test_lock_unavailable_fallback(self):
+        """Lock unavailable/broken -> run discovery unguarded (no retry)."""
+        from tools.mcp_tool import (
+            _LOCK_UNAVAILABLE,
+            discover_mcp_tools,
+        )
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", return_value=_LOCK_UNAVAILABLE), \
+             patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+             patch("tools.mcp_tool.register_mcp_servers") as reg_spy, \
+             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+            result = discover_mcp_tools()
+        reg_spy.assert_called_once_with(mock_config)
+
+    def test_windows_portalocker_handle_lifetime(self):
+        """_LockCookie keeps file handle alive until release()."""
+        import tempfile
+
+        from tools.mcp_tool import _LockCookie
+
+        with tempfile.NamedTemporaryFile(prefix="mcp-lock-", suffix=".tmp", delete=False) as tf:
+            lock_path = tf.name
+
+        try:
+            fh = open(lock_path, "w", encoding="utf-8")
+            self._lock_exclusive(fh)
+            cookie = _LockCookie(fh)
+            assert not fh.closed
+            fno = fh.fileno()
+            assert fno > 0
+            cookie.release()
+            assert fh.closed
+        finally:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+
+    def test_double_release_safety(self):
+        """Calling release() twice is safe (no exception)."""
+        import tempfile
+
+        from tools.mcp_tool import _LockCookie
+
+        with tempfile.NamedTemporaryFile(prefix="mcp-lock-", suffix=".tmp", delete=False) as tf:
+            lock_path = tf.name
+
+        try:
+            fh = open(lock_path, "w", encoding="utf-8")
+            self._lock_exclusive(fh)
+            cookie = _LockCookie(fh)
+            cookie.release()
+            assert fh.closed
+            # Second release -- must not raise
+            cookie.release()
+        finally:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+
+    def test_posix_flock_acquire_and_release(self):
+        """_acquire_lock_on_fh uses fcntl.flock on POSIX."""
+        import sys
+        import tempfile
+        from unittest.mock import MagicMock
+
+        mock_fcntl = MagicMock()
+        mock_fcntl.LOCK_EX = 2
+        mock_fcntl.LOCK_NB = 4
+
+        with tempfile.NamedTemporaryFile(prefix="mcp-lock-", suffix=".tmp", delete=False) as tf:
+            lock_path = tf.name
+
+        try:
+            fh = open(lock_path, "w", encoding="utf-8")
+            with patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+                 patch("tools.mcp_tool.os.name", "posix"):
+                from tools.mcp_tool import _acquire_lock_on_fh
+                result = _acquire_lock_on_fh(fh)
+            assert result is True
+            mock_fcntl.flock.assert_called_once_with(
+                fh.fileno(), mock_fcntl.LOCK_EX | mock_fcntl.LOCK_NB
+            )
+            fh.close()
+        finally:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+
+    def test_posix_flock_oserror_eagain_returns_false(self):
+        """POSIX fcntl.flock raising OSError(EAGAIN) -> return False (lock held)."""
+        import errno
+        import tempfile
+        from unittest.mock import MagicMock, patch
+
+        mock_fcntl = MagicMock()
+        mock_fcntl.LOCK_EX = 2
+        mock_fcntl.LOCK_NB = 4
+        mock_fcntl.flock.side_effect = OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        with tempfile.NamedTemporaryFile(prefix="mcp-lock-", suffix=".tmp", delete=False) as tf:
+            lock_path = tf.name
+
+        try:
+            fh = open(lock_path, "w", encoding="utf-8")
+            with patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+                 patch("tools.mcp_tool.os.name", "posix"):
+                from tools.mcp_tool import _acquire_lock_on_fh
+                result = _acquire_lock_on_fh(fh)
+            assert result is False
+            fh.close()
+        finally:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+
+    def test_two_concurrent_discovery_attempts(self):
+        """Two sequential calls both end up with a non-empty registry
+        (no early empty return). Each call gets its own cookie directly
+        on first acquire attempt."""
+        from tools.mcp_tool import (
+            _LOCK_UNAVAILABLE,
+            _LockCookie,
+            discover_mcp_tools,
+        )
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+
+        # Build two real cookie handles so release() works
+        import tempfile
+        tf1 = tempfile.NamedTemporaryFile(
+            prefix="mcp-lock-1-", suffix=".tmp", delete=False
+        )
+        tf2 = tempfile.NamedTemporaryFile(
+            prefix="mcp-lock-2-", suffix=".tmp", delete=False
+        )
+        lock_path1 = tf1.name
+        lock_path2 = tf2.name
+        cookie1 = _LockCookie(tf1)
+        cookie2 = _LockCookie(tf2)
+        self._lock_exclusive(tf1)
+        self._lock_exclusive(tf2)
+
+        def make_sequencer():
+            state = {"call": 0, "cookie1": cookie1, "cookie2": cookie2}
+            def seq():
+                state["call"] += 1
+                if state["call"] == 1:
+                    return state["cookie1"]
+                else:
+                    return state["cookie2"]
+            return seq
+
+        seq_fn = make_sequencer()
+
+        try:
+            with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", side_effect=seq_fn), \
+                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+                 patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp__test_srv__ping"]):
+                r1 = discover_mcp_tools()
+                r2 = discover_mcp_tools()
+
+            assert r1 == ["mcp__test_srv__ping"]
+            assert r2 == ["mcp__test_srv__ping"]
+        finally:
+            for path in (lock_path1, lock_path2):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
